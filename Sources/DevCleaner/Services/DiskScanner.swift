@@ -121,7 +121,7 @@ public final class DiskScanner: Sendable {
 
         var totalLogical: Int64 = 0
         var totalPhysical: Int64 = 0
-        var latestModified: Date? = rootModDate
+        var latestModified: Date? = nil
         var count = 0
         var seenInodes = Set<UInt64>()
 
@@ -167,16 +167,16 @@ public final class DiskScanner: Sendable {
                 }
             }
 
-            if let modDate = values.contentModificationDate {
-                if latestModified == nil || modDate > latestModified! {
-                    latestModified = modDate
-                }
-                if let cutoff = cutoffDate, values.isRegularFile == true, modDate > cutoff {
-                    continue
-                }
-            }
-
             if values.isRegularFile == true {
+                if let modDate = values.contentModificationDate {
+                    if latestModified == nil || modDate > latestModified! {
+                        latestModified = modDate
+                    }
+                    if let cutoff = cutoffDate, modDate > cutoff {
+                        continue
+                    }
+                }
+
                 let logical = Int64(values.totalFileSize ?? values.fileSize ?? Int(itemStat.st_size))
                 let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize
                 let physical = allocated != nil ? Int64(allocated!) : (Int64(itemStat.st_blocks) * 512)
@@ -190,7 +190,7 @@ public final class DiskScanner: Sendable {
         return DiskUsageInfo(
             logicalSize: totalLogical,
             physicalSize: totalPhysical,
-            lastModified: latestModified,
+            lastModified: latestModified ?? rootModDate,
             fileCount: count
         )
     }

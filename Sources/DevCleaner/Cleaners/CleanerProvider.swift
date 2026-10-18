@@ -67,7 +67,6 @@ public struct CleanupExecutor: Sendable {
         }
 
         // 4. Re-evaluate live running processes immediately before destructive execution
-        // (For Docker CLI prune, Docker Desktop is required to be running, so only block non-prune actions)
         let isDockerCLIPrune: Bool = {
             if case .dockerPrune = item.actionType { return true }
             return false
@@ -91,77 +90,128 @@ public struct CleanupExecutor: Sendable {
             let validatedPath = try validator.validateForDeletion(rawPath)
             try validator.validateSubtreeForDeletion(validatedPath)
             guard FileManager.default.fileExists(atPath: validatedPath) else {
-                return CleanupResult(processedBytes: 0, movedToTrashBytes: 0, actuallyFreedBytes: 0, action: .moveToTrash)
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
             }
             let beforeUsage = DiskScanner.shared.measurePath(validatedPath)
             let url = URL(fileURLWithPath: validatedPath)
             try trashHandler(url)
-            let freeAfter = freeSpaceProvider()
-            let freedDelta = max(0, freeAfter - freeBefore)
             let movedBytes = beforeUsage.physicalSize > 0 ? beforeUsage.physicalSize : item.reclaimableSize
+            if movedBytes == 0 {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
+            }
+            // Moving to Trash does not immediately free APFS disk blocks; never attribute background fluctuations
             return CleanupResult(
                 processedBytes: movedBytes,
                 movedToTrashBytes: movedBytes,
-                actuallyFreedBytes: freedDelta,
-                action: .moveToTrash
+                actuallyFreedBytes: 0,
+                action: .moveToTrash,
+                status: .cleaned,
+                message: "Moved to macOS Trash (\(Formatters.bytes(movedBytes))). Empty Trash to recover disk space."
             )
 
         case .moveToTrashContents(let directoryPath, let fixedAge):
             let validatedDir = try validator.validateForDeletion(directoryPath)
             guard FileManager.default.fileExists(atPath: validatedDir) else {
-                return CleanupResult(processedBytes: 0, movedToTrashBytes: 0, actuallyFreedBytes: 0, action: .moveToTrash)
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
             }
+
             let dirURL = URL(fileURLWithPath: validatedDir, isDirectory: true)
-            // Do NOT skip hidden files so we can inspect and block any hidden protected files (.git, .env, etc.)
-            let children = (try? FileManager.default.contentsOfDirectory(
+            let topLevelChildren = (try? FileManager.default.contentsOfDirectory(
                 at: dirURL,
-                includingPropertiesForKeys: [.contentModificationDateKey, .isSymbolicLinkKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                 options: []
             )) ?? []
 
-            // Pre-flight safety pass: ensure no child or nested descendant is a protected file (.git, .env, credentials) or escaping symlink
-            for child in children {
+            // Reject if any direct top-level file is itself a forbidden component (e.g. .env or .git placed directly in cache root)
+            for child in topLevelChildren {
                 if child.lastPathComponent == ".DS_Store" { continue }
-                let childValidated = try validator.validateForDeletion(child.path)
+                if validator.isForbiddenComponentName(child.lastPathComponent) {
+                    throw SafetyError.forbiddenFileOrComponent(child.path)
+                }
+            }
+
+            let effectiveFilter: AgeFilter = {
+                if let d = fixedAge, let f = AgeFilter(rawValue: d) {
+                    return f
+                }
+                return ageFilter
+            }()
+
+            let planner = CleanupPlanner(validator: validator)
+            let plan = planner.planDirectoryContents(
+                directoryPath: validatedDir,
+                baseRisk: item.riskLevel,
+                ageFilter: effectiveFilter,
+                supportsAgeFilter: true,
+                isRunningDependency: false
+            )
+
+            // If there are NO eligible entries and at least one protected/blocked entry, surface the SafetyError
+            if plan.eligibleEntries.isEmpty, let firstProtected = plan.protectedOrReviewEntries.first {
+                let childValidated = try validator.validateForDeletion(firstProtected.path)
                 try validator.validateSubtreeForDeletion(childValidated)
             }
 
-            let effectiveDays = fixedAge ?? (ageFilter.rawValue > 0 ? ageFilter.rawValue : nil)
-            let cutoff: Date? = effectiveDays != nil ? Date().addingTimeInterval(-Double(effectiveDays!) * 86400) : nil
-
-            var movedBytes: Int64 = 0
-            for child in children {
-                if child.lastPathComponent == ".DS_Store" { continue }
-                let childValidated = try validator.validateForDeletion(child.path)
-                let usage = DiskScanner.shared.measurePath(childValidated)
-
-                if let cutoffDate = cutoff {
-                    let resourceMod = (try? child.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                    let latestMod: Date? = {
-                        switch (resourceMod, usage.lastModified) {
-                        case let (a?, b?): return max(a, b)
-                        case let (a?, nil): return a
-                        case let (nil, b?): return b
-                        case (nil, nil): return nil
-                        }
-                    }()
-                    if let mod = latestMod, mod > cutoffDate {
-                        // Preserve recent file/folder
-                        continue
-                    }
-                }
-
-                try trashHandler(URL(fileURLWithPath: childValidated))
-                movedBytes += usage.physicalSize
+            if plan.eligibleEntries.isEmpty {
+                let noOpMsg = effectiveFilter != .all
+                    ? "Nothing eligible for cleanup with the current \(effectiveFilter.rawValue)-day filter."
+                    : "Nothing eligible for cleanup."
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: noOpMsg
+                )
             }
 
-            let freeAfter = freeSpaceProvider()
-            let freedDelta = max(0, freeAfter - freeBefore)
+            var movedBytes: Int64 = 0
+            for entry in plan.eligibleEntries {
+                // Re-validate immediately prior to trashing each eligible child
+                let childValidated = try validator.validateForDeletion(entry.path)
+                try validator.validateSubtreeForDeletion(childValidated)
+                try trashHandler(URL(fileURLWithPath: childValidated))
+                movedBytes += entry.physicalBytes
+            }
+
+            let skippedCount = plan.protectedOrReviewEntries.count
+            let summaryMsg: String = {
+                if skippedCount > 0 {
+                    return "Moved \(Formatters.bytes(movedBytes)) to macOS Trash (\(skippedCount) entry skipped for review)."
+                }
+                return "Moved \(Formatters.bytes(movedBytes)) to macOS Trash. Empty Trash to recover disk space."
+            }()
+
+            // For moveToTrash operations, per-item actuallyFreedBytes is 0 (blocks are freed when Trash is emptied)
             return CleanupResult(
                 processedBytes: movedBytes,
                 movedToTrashBytes: movedBytes,
-                actuallyFreedBytes: freedDelta,
-                action: .moveToTrash
+                actuallyFreedBytes: 0,
+                action: .moveToTrash,
+                status: movedBytes > 0 ? .cleaned : .nothingEligible,
+                message: summaryMsg
             )
 
         case .simctlDeleteDevice(let udid):
@@ -181,7 +231,9 @@ public struct CleanupExecutor: Sendable {
                 processedBytes: item.reclaimableSize,
                 movedToTrashBytes: 0,
                 actuallyFreedBytes: freedDelta,
-                action: .simctlDelete
+                action: .simctlDelete,
+                status: .cleaned,
+                message: "Deleted simulator \(udid) via simctl."
             )
 
         case .simctlDeleteUnavailable:
@@ -191,11 +243,16 @@ public struct CleanupExecutor: Sendable {
             }
             let freeAfter = freeSpaceProvider()
             let freedDelta = max(0, freeAfter - freeBefore)
+            let status: CleanupExecutionStatus = item.reclaimableSize > 0 ? .cleaned : .nothingEligible
             return CleanupResult(
                 processedBytes: item.reclaimableSize,
                 movedToTrashBytes: 0,
                 actuallyFreedBytes: freedDelta,
-                action: .simctlDelete
+                action: .simctlDelete,
+                status: status,
+                message: item.reclaimableSize > 0
+                    ? "Removed unavailable simulators via simctl."
+                    : "Nothing eligible for cleanup (0 unavailable simulator bytes)."
             )
 
         case .simctlDeleteRuntime(let identifier):
@@ -209,7 +266,9 @@ public struct CleanupExecutor: Sendable {
                 processedBytes: item.reclaimableSize,
                 movedToTrashBytes: 0,
                 actuallyFreedBytes: freedDelta,
-                action: .simctlDelete
+                action: .simctlDelete,
+                status: .cleaned,
+                message: "Deleted simulator runtime \(identifier) via simctl."
             )
 
         case .dockerPrune(let subcommand):
@@ -227,7 +286,9 @@ public struct CleanupExecutor: Sendable {
                 processedBytes: item.reclaimableSize,
                 movedToTrashBytes: 0,
                 actuallyFreedBytes: freedDelta,
-                action: .dockerPrune
+                action: .dockerPrune,
+                status: .cleaned,
+                message: "Executed docker \(subcommand.joined(separator: " "))."
             )
         }
     }

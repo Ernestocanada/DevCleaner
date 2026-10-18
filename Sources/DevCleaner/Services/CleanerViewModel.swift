@@ -72,6 +72,7 @@ public final class CleanerViewModel: ObservableObject {
             let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
             let idxB = categoryOrder.firstIndex(of: b.category) ?? 99
             if idxA != idxB { return idxA < idxB }
+            if a.riskLevel != b.riskLevel { return a.riskLevel < b.riskLevel }
             return a.physicalSize > b.physicalSize
         }
 
@@ -97,7 +98,7 @@ public final class CleanerViewModel: ObservableObject {
                 .filter { $0.riskLevel == .safe && $0.canBeSelected && $0.reclaimableSize > 0 }
                 .map { $0.id }
         )
-        statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items, simulators, VMs, and AI models are excluded."
+        statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items, protected subtrees, simulators, VMs, and AI models are excluded."
     }
 
     public func activateDevelopmentCleanupMode(filter: AgeFilter = .sevenDays) {
@@ -195,13 +196,12 @@ public final class CleanerViewModel: ObservableObject {
         let overallFreeBefore = DiskScanner.shared.freeDiskSpaceBytes()
         var totalProcessed: Int64 = 0
         var totalMovedToTrash: Int64 = 0
-        var totalItemFreedDelta: Int64 = 0
         var successCount = 0
+        var nothingEligibleCount = 0
         var failCount = 0
         var blockedMessages: [String] = []
 
         for item in targetItems {
-            // Re-evaluate live process state immediately before each item's destructive operation
             let latestSnapshot = await ProcessMonitor.shared.captureSnapshot()
             let activeProcs = latestSnapshot.matchingProcesses(for: item.category)
             let isDockerPrune: Bool = {
@@ -223,6 +223,7 @@ public final class CleanerViewModel: ObservableObject {
                     movedToTrashBytes: 0,
                     actuallyFreedBytes: 0,
                     actionDescription: item.actionKind.rawValue,
+                    status: .blocked,
                     success: false,
                     message: msg
                 )
@@ -235,33 +236,48 @@ public final class CleanerViewModel: ObservableObject {
                 let result = try await executor.execute(item, ageFilter: ageFilter)
                 totalProcessed += result.processedBytes
                 totalMovedToTrash += result.movedToTrashBytes
-                totalItemFreedDelta += result.actuallyFreedBytes
-                successCount += 1
 
-                let note: String = {
-                    if result.action == .moveToTrash {
-                        return "Moved to macOS Trash (\(Formatters.bytes(result.movedToTrashBytes))). Empty Trash to recover disk space."
-                    }
-                    return "Executed (\(result.action.rawValue))"
-                }()
-
-                let entry = CleanupHistoryEntry(
-                    category: item.category.rawValue,
-                    itemName: item.name,
-                    path: item.exactCommandOrPathDescription,
-                    processedBytes: result.processedBytes,
-                    movedToTrashBytes: result.movedToTrashBytes,
-                    actuallyFreedBytes: result.actuallyFreedBytes,
-                    actionDescription: result.action.rawValue,
-                    success: true,
-                    message: note
-                )
-                CleanupHistoryStore.shared.appendEntry(entry)
-                selectedIDs.remove(item.id)
+                if result.status == .nothingEligible {
+                    nothingEligibleCount += 1
+                    let noOpMsg = result.message ?? (ageFilter != .all
+                        ? "Nothing eligible for cleanup with the current \(ageFilter.rawValue)-day filter."
+                        : "Nothing eligible for cleanup.")
+                    let entry = CleanupHistoryEntry(
+                        category: item.category.rawValue,
+                        itemName: item.name,
+                        path: item.exactCommandOrPathDescription,
+                        processedBytes: 0,
+                        movedToTrashBytes: 0,
+                        actuallyFreedBytes: 0,
+                        actionDescription: result.action.rawValue,
+                        status: .nothingEligible,
+                        success: false,
+                        message: noOpMsg
+                    )
+                    CleanupHistoryStore.shared.appendEntry(entry)
+                } else {
+                    successCount += 1
+                    let note = result.message ?? "Moved to macOS Trash (\(Formatters.bytes(result.movedToTrashBytes))). Empty Trash to recover disk space."
+                    let entry = CleanupHistoryEntry(
+                        category: item.category.rawValue,
+                        itemName: item.name,
+                        path: item.exactCommandOrPathDescription,
+                        processedBytes: result.processedBytes,
+                        movedToTrashBytes: result.movedToTrashBytes,
+                        actuallyFreedBytes: result.actuallyFreedBytes,
+                        actionDescription: result.action.rawValue,
+                        status: result.status,
+                        success: true,
+                        message: note
+                    )
+                    CleanupHistoryStore.shared.appendEntry(entry)
+                    selectedIDs.remove(item.id)
+                }
             } catch {
                 failCount += 1
                 let errText = error.localizedDescription
                 blockedMessages.append(errText)
+                let status: CleanupExecutionStatus = (error is CleanerError || error is SafetyError) ? .blocked : .failed
                 let entry = CleanupHistoryEntry(
                     category: item.category.rawValue,
                     itemName: item.name,
@@ -270,6 +286,7 @@ public final class CleanerViewModel: ObservableObject {
                     movedToTrashBytes: 0,
                     actuallyFreedBytes: 0,
                     actionDescription: item.actionKind.rawValue,
+                    status: status,
                     success: false,
                     message: errText
                 )
@@ -278,15 +295,15 @@ public final class CleanerViewModel: ObservableObject {
         }
 
         let overallFreeAfter = DiskScanner.shared.freeDiskSpaceBytes()
-        let measuredOverallDelta = max(0, overallFreeAfter - overallFreeBefore)
-        let effectiveFreed = max(measuredOverallDelta, totalItemFreedDelta)
+        let observedDelta = max(0, overallFreeAfter - overallFreeBefore)
 
         self.lastCleanupSummary = CleanupBatchSummary(
             date: Date(),
             processedBytes: totalProcessed,
             movedToTrashBytes: totalMovedToTrash,
-            actuallyFreedBytes: effectiveFreed,
+            observedSystemFreeSpaceDelta: observedDelta,
             succeededCount: successCount,
+            nothingEligibleCount: nothingEligibleCount,
             failedOrBlockedCount: failCount,
             blockedMessages: blockedMessages
         )
@@ -294,8 +311,12 @@ public final class CleanerViewModel: ObservableObject {
 
         if !blockedMessages.isEmpty && successCount == 0 {
             self.statusBannerMessage = blockedMessages.first
+        } else if successCount == 0 && nothingEligibleCount > 0 {
+            self.statusBannerMessage = ageFilter != .all
+                ? "Nothing eligible for cleanup with the current \(ageFilter.rawValue)-day filter."
+                : "Nothing eligible for cleanup."
         } else {
-            self.statusBannerMessage = "Cleanup completed — Processed: \(Formatters.bytes(totalProcessed)) • Moved to Trash: \(Formatters.bytes(totalMovedToTrash)) • Disk freed now: \(Formatters.bytes(effectiveFreed))."
+            self.statusBannerMessage = "Cleanup completed — Processed: \(Formatters.bytes(totalProcessed)) • Moved to Trash: \(Formatters.bytes(totalMovedToTrash)) • Observed system free-space change: \(Formatters.bytes(observedDelta))."
         }
 
         await performScan()
@@ -315,6 +336,7 @@ public final class CleanerViewModel: ObservableObject {
             movedToTrashBytes: 0,
             actuallyFreedBytes: delta,
             actionDescription: CleanupResultAction.simctlDelete.rawValue,
+            status: res.isSuccess ? .cleaned : .failed,
             success: res.isSuccess,
             message: res.isSuccess ? "Runtime deleted via simctl" : res.stderr
         )

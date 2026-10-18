@@ -105,11 +105,17 @@ public struct DashboardView: View {
     }
 
     private func lastCleanupBanner(summary: CleanupBatchSummary) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 16) {
-                Label("Last Cleanup Completed", systemImage: "checkmark.seal.fill")
-                    .font(.subheadline.bold())
-                    .foregroundColor(.green)
+                if summary.succeededCount == 0 && summary.nothingEligibleCount > 0 {
+                    Label("Nothing Eligible for Cleanup", systemImage: "minus.circle.fill")
+                        .font(.subheadline.bold())
+                        .foregroundColor(.secondary)
+                } else {
+                    Label("Last Cleanup Completed", systemImage: "checkmark.seal.fill")
+                        .font(.subheadline.bold())
+                        .foregroundColor(.green)
+                }
 
                 Text("Processed: \(Formatters.bytes(summary.processedBytes))")
                     .font(.caption.monospacedDigit().bold())
@@ -118,15 +124,9 @@ public struct DashboardView: View {
                     .font(.caption.monospacedDigit().bold())
                     .foregroundColor(.blue)
 
-                Text("Actually Freed Now: \(Formatters.bytes(summary.actuallyFreedBytes))")
+                Text("Observed system free-space change: \(Formatters.bytes(summary.observedSystemFreeSpaceDelta))")
                     .font(.caption.monospacedDigit().bold())
-                    .foregroundColor(.green)
-
-                if summary.movedToTrashBytes > 0 {
-                    Text("Empty the macOS Trash to recover the remaining disk space.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                    .foregroundColor(.secondary)
 
                 Spacer()
 
@@ -146,6 +146,17 @@ public struct DashboardView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 12) {
+                Text("This free-space value is system-wide and may include unrelated APFS/macOS activity.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                if summary.movedToTrashBytes > 0 {
+                    Text("•  Empty the macOS Trash to recover the remaining disk space.")
+                        .font(.caption2.weight(.medium))
+                        .foregroundColor(.primary)
+                }
             }
 
             if !summary.blockedMessages.isEmpty {

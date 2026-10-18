@@ -722,6 +722,135 @@ final class CleanupHardeningTests: XCTestCase {
             try FileManager.default.removeItem(at: tempHome.appendingPathComponent(subDirRel))
         }
     }
+
+    // MARK: - 7. v1.2 Regression Tests: Plan Alignment, Partial Cache Cleaning, Age-Filter Accuracy, No-Op & Free-Space Semantics
+
+    func testAgeFilterEstimateMatchesExecutableBytesExactly() async throws {
+        // Create a large recent cache child (~4.8 MB) modified 1 day ago, and a small old child (~200 KB) modified 10 days ago
+        let recentChild = try createFile(
+            relativeToHome: ".gradle/caches/modules-recent/big-recent.bin",
+            sizeBytes: 4_800_000,
+            modifiedDaysAgo: 1
+        )
+        let oldChild = try createFile(
+            relativeToHome: ".gradle/caches/modules-old/small-old.bin",
+            sizeBytes: 204_800,
+            modifiedDaysAgo: 10
+        )
+
+        let executor = makeIsolatedExecutor()
+        let gradleCleaner = StandardCacheCleaner(category: .gradle, homeDirectory: tempHome.path, executor: executor)
+
+        // Scan with 7-day filter
+        let scannedItems = await gradleCleaner.scan(snapshot: .empty, ageFilter: .sevenDays)
+        let gradleItem = try XCTUnwrap(scannedItems.first { $0.id == "gradle-caches" })
+
+        // Total physical size is ~5 MB, but reclaimableSize (Preview estimate) must be ~200 KB (the exact old child), NOT 5 MB
+        XCTAssertGreaterThanOrEqual(gradleItem.physicalSize, 5_000_000)
+        XCTAssertLessThan(gradleItem.reclaimableSize, 300_000, "Preview estimate must not show the full 5 MB directory when only ~200 KB is older than 7 days")
+        XCTAssertGreaterThanOrEqual(gradleItem.reclaimableSize, 204_800)
+
+        // Plan eligibleBytes must equal item.reclaimableSize AND executor processedBytes
+        let plannedEligibleBytes = try XCTUnwrap(gradleItem.plan?.eligibleBytes)
+        XCTAssertEqual(gradleItem.reclaimableSize, plannedEligibleBytes)
+
+        let execResult = try await executor.execute(gradleItem, ageFilter: .sevenDays)
+        XCTAssertEqual(execResult.processedBytes, gradleItem.reclaimableSize, "Executor processedBytes must exactly match Preview reclaimableSize")
+        XCTAssertEqual(execResult.movedToTrashBytes, plannedEligibleBytes)
+        XCTAssertEqual(execResult.status, .cleaned)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldChild.path), "Old child must be cleaned")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recentChild.path), "Recent child must be preserved")
+    }
+
+    func testProtectedChildInDisposableCacheIsIsolatedAndSiblingsAreCleaned() async throws {
+        // cache-A: SAFE
+        let fileA = try createFile(
+            relativeToHome: ".npm/_npx/cache-A/node_modules/pkgA/index.js",
+            sizeBytes: 16384
+        )
+        // cache-B: contains .env inside node_modules/twilio-cli/node_modules/bottleneck/.env
+        let fileBEnv = try createFile(
+            relativeToHome: ".npm/_npx/cache-B/node_modules/twilio-cli/node_modules/bottleneck/.env",
+            sizeBytes: 37
+        )
+        // cache-C: SAFE
+        let fileC = try createFile(
+            relativeToHome: ".npm/_npx/cache-C/node_modules/pkgC/index.js",
+            sizeBytes: 16384
+        )
+
+        // Verify .env inside node_modules remains strictly blocked by SafetyValidator
+        XCTAssertFalse(validator.isSafeToDelete(fileBEnv.path, checkSymlinksOnDisk: false), ".env must remain strictly protected even inside node_modules")
+
+        let executor = makeIsolatedExecutor()
+        let npmCleaner = StandardCacheCleaner(category: .nodeNpm, homeDirectory: tempHome.path, executor: executor)
+        let scannedItems = await npmCleaner.scan(snapshot: .empty, ageFilter: .all)
+
+        // Expect:
+        // 1) Main SAFE item for _npx containing eligible entries cache-A and cache-C only
+        let safeNpxItem = try XCTUnwrap(scannedItems.first { $0.id == "npm-npx" })
+        XCTAssertEqual(safeNpxItem.riskLevel, .safe)
+        XCTAssertTrue(safeNpxItem.canBeSelected)
+        let eligibleNames = Set(safeNpxItem.plan?.eligibleEntries.map { $0.name } ?? [])
+        XCTAssertEqual(eligibleNames, Set(["cache-A", "cache-C"]), "Recommended SAFE item must include cache-A and cache-C only")
+
+        // 2) Isolated REVIEW item for cache-B (contains .env), not selectable by Recommended Cleanup
+        let reviewChildItem = try XCTUnwrap(scannedItems.first { $0.id == "npm-npx-review-cache-B" })
+        XCTAssertEqual(reviewChildItem.riskLevel, .review)
+        XCTAssertFalse(reviewChildItem.canBeSelected, "Protected child cache-B must not be selectable by Recommended Cleanup")
+        XCTAssertTrue(reviewChildItem.explanation.contains("Contains protected-looking environment file"))
+
+        // 3) Executing the SAFE item cleans cache-A and cache-C while preserving cache-B
+        let result = try await executor.execute(safeNpxItem, ageFilter: .all)
+        XCTAssertEqual(result.status, .cleaned)
+        XCTAssertEqual(result.processedBytes, safeNpxItem.reclaimableSize)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileA.path), "cache-A must be cleaned")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileC.path), "cache-C must be cleaned")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileBEnv.path), "cache-B containing .env must be preserved untouched")
+    }
+
+    func testNoOpCleanupWhenNothingEligibleReportsNothingEligibleStatus() async throws {
+        // Only recent file (1 day old) exists, and we run with 7-day filter
+        let recentFile = try createFile(
+            relativeToHome: "Library/Caches/Homebrew/downloads/recent-bottle.tar.gz",
+            sizeBytes: 8192,
+            modifiedDaysAgo: 1
+        )
+
+        let executor = makeIsolatedExecutor()
+        let brewCleaner = StandardCacheCleaner(category: .homebrew, homeDirectory: tempHome.path, executor: executor)
+        let scannedItems = await brewCleaner.scan(snapshot: .empty, ageFilter: .sevenDays)
+        let brewItem = try XCTUnwrap(scannedItems.first { $0.id == "homebrew-cache" })
+
+        XCTAssertEqual(brewItem.reclaimableSize, 0)
+        XCTAssertFalse(brewItem.canBeSelected, "0-byte eligible item must not be selectable")
+
+        let result = try await executor.execute(brewItem, ageFilter: .sevenDays)
+        XCTAssertEqual(result.status, .nothingEligible, "Zero-byte cleanup must report .nothingEligible, not .cleaned")
+        XCTAssertEqual(result.processedBytes, 0)
+        XCTAssertEqual(result.movedToTrashBytes, 0)
+        XCTAssertTrue(result.message?.contains("Nothing eligible for cleanup") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recentFile.path))
+    }
+
+    func testTrashOperationNeverFabricatesPerItemFreedSpaceFromAPFSFluctuations() async throws {
+        _ = try createFile(relativeToHome: "Library/Caches/pip/wheels/pkg.whl", sizeBytes: 4096)
+
+        // Simulate background APFS free-space fluctuation of +1.4 MB during a 4 KB moveToTrash operation
+        let executor = makeIsolatedExecutor(
+            simulatedFreeBefore: 100_000_000_000,
+            simulatedFreeAfter: 100_001_400_000
+        )
+        let pipCleaner = StandardCacheCleaner(category: .generalCaches, homeDirectory: tempHome.path, executor: executor)
+        let items = await pipCleaner.scan(snapshot: .empty, ageFilter: .all)
+        let pipItem = try XCTUnwrap(items.first { $0.id == "pip-cache" })
+
+        let result = try await executor.execute(pipItem, ageFilter: .all)
+        XCTAssertEqual(result.status, .cleaned)
+        XCTAssertGreaterThan(result.movedToTrashBytes, 0)
+        XCTAssertEqual(result.actuallyFreedBytes, 0, "Per-item actuallyFreedBytes for moveToTrash must be 0 and never attribute unrelated APFS fluctuations")
+    }
 }
 
 private final class LockCounter: @unchecked Sendable {

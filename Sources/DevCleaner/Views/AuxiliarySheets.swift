@@ -8,6 +8,24 @@ public struct CleanupHistorySheet: View {
         self.viewModel = viewModel
     }
 
+    private func statusColor(for status: CleanupExecutionStatus) -> Color {
+        switch status {
+        case .cleaned: return .green
+        case .nothingEligible, .skipped: return .secondary
+        case .blocked: return .orange
+        case .failed: return .red
+        }
+    }
+
+    private func statusIcon(for status: CleanupExecutionStatus) -> String {
+        switch status {
+        case .cleaned: return "checkmark.circle.fill"
+        case .nothingEligible, .skipped: return "minus.circle.fill"
+        case .blocked: return "exclamationmark.triangle.fill"
+        case .failed: return "xmark.circle.fill"
+        }
+    }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -43,9 +61,16 @@ public struct CleanupHistorySheet: View {
             } else {
                 List(viewModel.historyEntries) { entry in
                     VStack(alignment: .leading, spacing: 5) {
-                        HStack {
-                            Image(systemName: entry.success ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundColor(entry.success ? .green : .orange)
+                        HStack(spacing: 8) {
+                            Image(systemName: statusIcon(for: entry.status))
+                                .foregroundColor(statusColor(for: entry.status))
+                            Text(entry.status.rawValue.uppercased())
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(statusColor(for: entry.status).opacity(0.15))
+                                .foregroundColor(statusColor(for: entry.status))
+                                .cornerRadius(4)
                             Text(entry.itemName)
                                 .font(.subheadline.bold())
                             Text("(\(entry.category))")
@@ -65,9 +90,11 @@ public struct CleanupHistorySheet: View {
                             Text("Moved to Trash: \(Formatters.bytes(entry.movedToTrashBytes))")
                                 .font(.caption.monospacedDigit())
                                 .foregroundColor(.blue)
-                            Text("Disk Freed Delta: \(Formatters.bytes(entry.actuallyFreedBytes))")
-                                .font(.caption.monospacedDigit().bold())
-                                .foregroundColor(.green)
+                            if entry.actuallyFreedBytes > 0 {
+                                Text("Observed Free-Space Delta: \(Formatters.bytes(entry.actuallyFreedBytes))")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                            }
                         }
 
                         Text(entry.path)
@@ -78,7 +105,7 @@ public struct CleanupHistorySheet: View {
                         if let msg = entry.message, !msg.isEmpty {
                             Text(msg)
                                 .font(.caption)
-                                .foregroundColor(entry.success ? .secondary : .orange)
+                                .foregroundColor(statusColor(for: entry.status))
                         }
                     }
                     .padding(.vertical, 4)

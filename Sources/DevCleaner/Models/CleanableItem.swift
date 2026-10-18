@@ -71,22 +71,127 @@ public enum CleanupResultAction: String, Codable, Equatable, Sendable {
     case none = "None"
 }
 
+public enum CleanupExecutionStatus: String, Codable, Equatable, Sendable {
+    case cleaned = "Cleaned"
+    case skipped = "Skipped"
+    case blocked = "Blocked"
+    case failed = "Failed"
+    case nothingEligible = "Nothing Eligible"
+}
+
+public enum CleanupEligibility: String, Codable, Equatable, Sendable {
+    case eligible = "ELIGIBLE"
+    case protected = "PROTECTED"
+    case runningProcess = "RUNNING PROCESS"
+    case tooRecent = "TOO RECENT"
+    case requiresReview = "REQUIRES REVIEW"
+}
+
+public struct CleanupPlanEntry: Identifiable, Codable, Equatable, Sendable {
+    public var id: String { path }
+    public let name: String
+    public let path: String
+    public let physicalBytes: Int64
+    public let logicalBytes: Int64
+    public let lastModified: Date?
+    public let action: CleanupActionType
+    public let risk: RiskLevel
+    public let eligibility: CleanupEligibility
+    public let reason: String?
+
+    public init(
+        name: String,
+        path: String,
+        physicalBytes: Int64,
+        logicalBytes: Int64 = 0,
+        lastModified: Date? = nil,
+        action: CleanupActionType,
+        risk: RiskLevel,
+        eligibility: CleanupEligibility,
+        reason: String? = nil
+    ) {
+        self.name = name
+        self.path = path
+        self.physicalBytes = physicalBytes
+        self.logicalBytes = logicalBytes == 0 ? physicalBytes : logicalBytes
+        self.lastModified = lastModified
+        self.action = action
+        self.risk = risk
+        self.eligibility = eligibility
+        self.reason = reason
+    }
+}
+
+public struct CleanupPlan: Codable, Equatable, Sendable {
+    public let entries: [CleanupPlanEntry]
+
+    public init(entries: [CleanupPlanEntry]) {
+        self.entries = entries
+    }
+
+    public var eligibleEntries: [CleanupPlanEntry] {
+        entries.filter { $0.eligibility == .eligible }
+    }
+
+    public var protectedOrReviewEntries: [CleanupPlanEntry] {
+        entries.filter { $0.eligibility == .protected || $0.eligibility == .requiresReview }
+    }
+
+    public var tooRecentEntries: [CleanupPlanEntry] {
+        entries.filter { $0.eligibility == .tooRecent }
+    }
+
+    public var runningProcessEntries: [CleanupPlanEntry] {
+        entries.filter { $0.eligibility == .runningProcess }
+    }
+
+    public var eligibleBytes: Int64 {
+        eligibleEntries.reduce(0) { $0 + $1.physicalBytes }
+    }
+
+    public var protectedOrReviewBytes: Int64 {
+        protectedOrReviewEntries.reduce(0) { $0 + $1.physicalBytes }
+    }
+
+    public var tooRecentBytes: Int64 {
+        tooRecentEntries.reduce(0) { $0 + $1.physicalBytes }
+    }
+
+    public var totalPhysicalBytes: Int64 {
+        entries.reduce(0) { $0 + $1.physicalBytes }
+    }
+
+    public var totalLogicalBytes: Int64 {
+        entries.reduce(0) { $0 + $1.logicalBytes }
+    }
+
+    public var latestModified: Date? {
+        entries.compactMap { $0.lastModified }.max()
+    }
+}
+
 public struct CleanupResult: Codable, Equatable, Sendable {
     public let processedBytes: Int64
     public let movedToTrashBytes: Int64
     public let actuallyFreedBytes: Int64
     public let action: CleanupResultAction
+    public let status: CleanupExecutionStatus
+    public let message: String?
 
     public init(
         processedBytes: Int64,
         movedToTrashBytes: Int64,
         actuallyFreedBytes: Int64,
-        action: CleanupResultAction
+        action: CleanupResultAction,
+        status: CleanupExecutionStatus = .cleaned,
+        message: String? = nil
     ) {
         self.processedBytes = processedBytes
         self.movedToTrashBytes = movedToTrashBytes
         self.actuallyFreedBytes = actuallyFreedBytes
         self.action = action
+        self.status = status
+        self.message = message
     }
 }
 
@@ -94,25 +199,32 @@ public struct CleanupBatchSummary: Equatable, Sendable {
     public let date: Date
     public let processedBytes: Int64
     public let movedToTrashBytes: Int64
-    public let actuallyFreedBytes: Int64
+    public let observedSystemFreeSpaceDelta: Int64
     public let succeededCount: Int
+    public let nothingEligibleCount: Int
     public let failedOrBlockedCount: Int
     public let blockedMessages: [String]
+
+    public var actuallyFreedBytes: Int64 {
+        observedSystemFreeSpaceDelta
+    }
 
     public init(
         date: Date = Date(),
         processedBytes: Int64,
         movedToTrashBytes: Int64,
-        actuallyFreedBytes: Int64,
+        observedSystemFreeSpaceDelta: Int64,
         succeededCount: Int,
+        nothingEligibleCount: Int = 0,
         failedOrBlockedCount: Int,
         blockedMessages: [String] = []
     ) {
         self.date = date
         self.processedBytes = processedBytes
         self.movedToTrashBytes = movedToTrashBytes
-        self.actuallyFreedBytes = actuallyFreedBytes
+        self.observedSystemFreeSpaceDelta = observedSystemFreeSpaceDelta
         self.succeededCount = succeededCount
+        self.nothingEligibleCount = nothingEligibleCount
         self.failedOrBlockedCount = failedOrBlockedCount
         self.blockedMessages = blockedMessages
     }
@@ -166,6 +278,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
     public let actionType: CleanupActionType
     public let simulatorMetadata: SimulatorMetadata?
     public let supportsAgeFilter: Bool
+    public let plan: CleanupPlan?
 
     public init(
         id: String,
@@ -184,7 +297,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         runningProcessNames: [String] = [],
         actionType: CleanupActionType,
         simulatorMetadata: SimulatorMetadata? = nil,
-        supportsAgeFilter: Bool = false
+        supportsAgeFilter: Bool = false,
+        plan: CleanupPlan? = nil
     ) {
         self.id = id
         self.name = name
@@ -203,6 +317,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         self.actionType = actionType
         self.simulatorMetadata = simulatorMetadata
         self.supportsAgeFilter = supportsAgeFilter
+        self.plan = plan
     }
 
     public var canBeSelected: Bool {
@@ -283,6 +398,7 @@ public struct CleanupHistoryEntry: Identifiable, Codable, Equatable, Sendable {
     public let movedToTrashBytes: Int64
     public let actuallyFreedBytes: Int64
     public let actionDescription: String
+    public let status: CleanupExecutionStatus
     public let success: Bool
     public let message: String?
 
@@ -300,6 +416,7 @@ public struct CleanupHistoryEntry: Identifiable, Codable, Equatable, Sendable {
         movedToTrashBytes: Int64,
         actuallyFreedBytes: Int64,
         actionDescription: String,
+        status: CleanupExecutionStatus? = nil,
         success: Bool,
         message: String? = nil
     ) {
@@ -312,6 +429,15 @@ public struct CleanupHistoryEntry: Identifiable, Codable, Equatable, Sendable {
         self.movedToTrashBytes = movedToTrashBytes
         self.actuallyFreedBytes = actuallyFreedBytes
         self.actionDescription = actionDescription
+        if let explicitStatus = status {
+            self.status = explicitStatus
+        } else if !success {
+            self.status = .failed
+        } else if processedBytes == 0 && movedToTrashBytes == 0 {
+            self.status = .nothingEligible
+        } else {
+            self.status = .cleaned
+        }
         self.success = success
         self.message = message
     }
@@ -319,7 +445,7 @@ public struct CleanupHistoryEntry: Identifiable, Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, date, category, itemName, path
         case processedBytes, movedToTrashBytes, actuallyFreedBytes, bytesReclaimed
-        case actionDescription, success, message
+        case actionDescription, status, success, message
     }
 
     public init(from decoder: Decoder) throws {
@@ -330,12 +456,24 @@ public struct CleanupHistoryEntry: Identifiable, Codable, Equatable, Sendable {
         self.itemName = try container.decode(String.self, forKey: .itemName)
         self.path = try container.decode(String.self, forKey: .path)
         let legacyBytes = try container.decodeIfPresent(Int64.self, forKey: .bytesReclaimed) ?? 0
-        self.processedBytes = try container.decodeIfPresent(Int64.self, forKey: .processedBytes) ?? legacyBytes
-        self.movedToTrashBytes = try container.decodeIfPresent(Int64.self, forKey: .movedToTrashBytes) ?? legacyBytes
+        let proc = try container.decodeIfPresent(Int64.self, forKey: .processedBytes) ?? legacyBytes
+        let trashed = try container.decodeIfPresent(Int64.self, forKey: .movedToTrashBytes) ?? legacyBytes
+        self.processedBytes = proc
+        self.movedToTrashBytes = trashed
         self.actuallyFreedBytes = try container.decodeIfPresent(Int64.self, forKey: .actuallyFreedBytes) ?? 0
         self.actionDescription = try container.decode(String.self, forKey: .actionDescription)
-        self.success = try container.decode(Bool.self, forKey: .success)
+        let succ = try container.decode(Bool.self, forKey: .success)
+        self.success = succ
         self.message = try container.decodeIfPresent(String.self, forKey: .message)
+        if let decodedStatus = try container.decodeIfPresent(CleanupExecutionStatus.self, forKey: .status) {
+            self.status = decodedStatus
+        } else if !succ {
+            self.status = .failed
+        } else if proc == 0 && trashed == 0 {
+            self.status = .nothingEligible
+        } else {
+            self.status = .cleaned
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -349,6 +487,7 @@ public struct CleanupHistoryEntry: Identifiable, Codable, Equatable, Sendable {
         try container.encode(movedToTrashBytes, forKey: .movedToTrashBytes)
         try container.encode(actuallyFreedBytes, forKey: .actuallyFreedBytes)
         try container.encode(actionDescription, forKey: .actionDescription)
+        try container.encode(status, forKey: .status)
         try container.encode(success, forKey: .success)
         try container.encodeIfPresent(message, forKey: .message)
     }

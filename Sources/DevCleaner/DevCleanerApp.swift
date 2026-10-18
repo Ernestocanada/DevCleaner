@@ -31,30 +31,46 @@ public struct DevCleanerApp: App {
     private static func runHeadlessReadOnlyReport() async {
         let vm = await MainActor.run { CleanerViewModel() }
         await vm.performScan()
-        await MainActor.run {
-            print("=================================================================")
-            print("DevCleaner Read-Only Scan Report")
-            print("Free Disk Space:          \(Formatters.bytes(vm.freeSpaceBytes))")
-            print("Potential Cleanup (Est.): \(Formatters.bytes(vm.totalReclaimableBytes))")
-            print("  - SAFE potential:       \(Formatters.bytes(vm.potentialBytes(for: .safe)))")
-            print("  - REVIEW potential:     \(Formatters.bytes(vm.potentialBytes(for: .review)))")
-            print("  - CAUTION potential:    \(Formatters.bytes(vm.potentialBytes(for: .caution)))")
-            print("Selected (Recommended):   \(Formatters.bytes(vm.selectedReclaimableBytes))")
-            print("=================================================================")
-            for cat in CleanerCategory.allCases {
-                let catItems = vm.items(for: cat)
-                guard !catItems.isEmpty else { continue }
-                let phys = vm.categoryTotalPhysical(for: cat)
-                let rec = vm.categoryReclaimable(for: cat)
-                print("\n[\(cat.rawValue)] — Disk Usage: \(Formatters.bytes(phys)) | Potential Cleanup: \(Formatters.bytes(rec))")
-                for item in catItems {
-                    let sparseNote = item.hasSparseDifference ? " (Logical sparse: \(Formatters.bytes(item.logicalSize)))" : ""
-                    let activeNote = item.isRunningDependency ? " [ACTIVE PROCESS: \(item.runningProcessNames.joined(separator: ", "))]" : ""
-                    print("  • [\(item.riskLevel.rawValue)] \(item.name): \(Formatters.bytes(item.physicalSize))\(sparseNote) -> Potential: \(Formatters.bytes(item.reclaimableSize))\(activeNote)")
-                    print("      Target: \(item.exactCommandOrPathDescription)")
+        let recommendedAllAges = await MainActor.run { vm.selectedReclaimableBytes }
+        let safeAllAges = await MainActor.run { vm.potentialBytes(for: .safe) }
+        let reviewAllAges = await MainActor.run { vm.potentialBytes(for: .review) }
+        let cautionAllAges = await MainActor.run { vm.potentialBytes(for: .caution) }
+        let totalAllAges = await MainActor.run { vm.totalReclaimableBytes }
+        let freeSpace = await MainActor.run { vm.freeSpaceBytes }
+        let allItems = await MainActor.run { vm.items }
+
+        // Also compute 7-day Development Cleanup read-only estimate
+        await MainActor.run { vm.ageFilter = .sevenDays }
+        await vm.performScan()
+        await MainActor.run { vm.selectRecommendedSafeItems() }
+        let recommendedSevenDays = await MainActor.run { vm.selectedReclaimableBytes }
+
+        print("=================================================================")
+        print("DevCleaner Read-Only Scan Report (v1.2 Unified CleanupPlanner)")
+        print("Free Disk Space:                   \(Formatters.bytes(freeSpace))")
+        print("Potential Cleanup (All Ages):      \(Formatters.bytes(totalAllAges))")
+        print("  - SAFE potential:                \(Formatters.bytes(safeAllAges))")
+        print("  - REVIEW potential:              \(Formatters.bytes(reviewAllAges))")
+        print("  - CAUTION potential:             \(Formatters.bytes(cautionAllAges))")
+        print("Recommended Cleanup (SAFE, All):   \(Formatters.bytes(recommendedAllAges))")
+        print("Development Cleanup (SAFE, >7d):   \(Formatters.bytes(recommendedSevenDays))")
+        print("=================================================================")
+        for cat in CleanerCategory.allCases {
+            let catItems = allItems.filter { $0.category == cat }
+            guard !catItems.isEmpty else { continue }
+            let phys = catItems.reduce(0) { $0 + $1.physicalSize }
+            let rec = catItems.filter { $0.riskLevel != .neverDelete }.reduce(0) { $0 + $1.reclaimableSize }
+            print("\n[\(cat.rawValue)] — Disk Usage: \(Formatters.bytes(phys)) | Potential Cleanup: \(Formatters.bytes(rec))")
+            for item in catItems {
+                let sparseNote = item.hasSparseDifference ? " (Logical sparse: \(Formatters.bytes(item.logicalSize)))" : ""
+                let activeNote = item.isRunningDependency ? " [ACTIVE PROCESS: \(item.runningProcessNames.joined(separator: ", "))]" : ""
+                print("  • [\(item.riskLevel.rawValue)] \(item.name): \(Formatters.bytes(item.physicalSize))\(sparseNote) -> Potential: \(Formatters.bytes(item.reclaimableSize))\(activeNote)")
+                print("      Target: \(item.exactCommandOrPathDescription)")
+                if item.id.contains("-review-") {
+                    print("      Reason: \(item.explanation)")
                 }
             }
-            print("\n=================================================================")
         }
+        print("\n=================================================================")
     }
 }

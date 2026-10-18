@@ -19,8 +19,25 @@ public struct CleanupPreviewSheet: View {
         itemsToPreview.filter { $0.riskLevel == risk }.reduce(0) { $0 + $1.reclaimableSize }
     }
 
+    private var tooRecentPreservedBytes: Int64 {
+        itemsToPreview.compactMap { $0.plan?.tooRecentBytes }.reduce(0, +)
+    }
+
+    private var protectedSkippedItemsInScope: [CleanableItem] {
+        let previewCategories = Set(itemsToPreview.map { $0.category })
+        return viewModel.items.filter { item in
+            previewCategories.contains(item.category) &&
+            item.id.contains("-review-") &&
+            item.riskLevel == .review
+        }
+    }
+
+    private var protectedSkippedBytes: Int64 {
+        protectedSkippedItemsInScope.reduce(0) { $0 + $1.physicalSize }
+    }
+
     private var safeOnlyItems: [CleanableItem] {
-        itemsToPreview.filter { $0.riskLevel == .safe }
+        itemsToPreview.filter { $0.riskLevel == .safe && $0.reclaimableSize > 0 }
     }
 
     private var hasCautionItems: Bool {
@@ -59,13 +76,15 @@ public struct CleanupPreviewSheet: View {
                 Spacer()
             }
 
-            HStack(spacing: 16) {
-                riskSummaryCard(risk: .safe, bytes: bytesForRisk(.safe))
-                riskSummaryCard(risk: .review, bytes: bytesForRisk(.review))
-                riskSummaryCard(risk: .caution, bytes: bytesForRisk(.caution))
+            HStack(spacing: 12) {
+                planStatusCard(title: "ELIGIBLE SAFE", bytes: bytesForRisk(.safe), color: .green)
+                if bytesForRisk(.review) > 0 || bytesForRisk(.caution) > 0 {
+                    planStatusCard(title: "ELIGIBLE REVIEW/CAUTION", bytes: bytesForRisk(.review) + bytesForRisk(.caution), color: .orange)
+                }
+                planStatusCard(title: "REVIEW / BLOCKED (Skipped)", bytes: protectedSkippedBytes, color: .orange)
+                planStatusCard(title: "TOO RECENT (Preserved)", bytes: tooRecentPreservedBytes, color: .secondary)
             }
 
-            // Action type breakdown & Trash semantics notice
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 12) {
                     if trashCount > 0 {
@@ -94,37 +113,86 @@ public struct CleanupPreviewSheet: View {
             .background(Color.blue.opacity(0.08))
             .cornerRadius(8)
 
-            Text("Exact path or command for each item:")
+            Text("Planned actions and eligibility breakdown:")
                 .font(.caption.bold())
                 .foregroundColor(.secondary)
 
-            List(itemsToPreview) { item in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        RiskBadgeView(risk: item.riskLevel)
-                        Text(item.actionKind.rawValue)
-                            .font(.system(size: 10, weight: .semibold, design: .rounded))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.secondary.opacity(0.15))
-                            .cornerRadius(4)
-                        Text(item.name)
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                        Text(Formatters.bytes(item.reclaimableSize))
-                            .font(.subheadline.monospacedDigit().bold())
+            List {
+                Section("ELIGIBLE FOR EXECUTION (\(Formatters.bytes(totalProcessing)))") {
+                    ForEach(itemsToPreview) { item in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                RiskBadgeView(risk: item.riskLevel)
+                                Text("ELIGIBLE")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.green.opacity(0.16))
+                                    .foregroundColor(.green)
+                                    .cornerRadius(4)
+                                Text(item.actionKind.rawValue)
+                                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(0.15))
+                                    .cornerRadius(4)
+                                Text(item.name)
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                Text(Formatters.bytes(item.reclaimableSize))
+                                    .font(.subheadline.monospacedDigit().bold())
+                            }
+                            Text(item.exactCommandOrPathDescription)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                            if let plan = item.plan {
+                                Text("Planned eligible entries: \(plan.eligibleEntries.count) (\(Formatters.bytes(plan.eligibleBytes)))" + (plan.tooRecentEntries.isEmpty ? "" : " • Preserved too recent: \(plan.tooRecentEntries.count) (\(Formatters.bytes(plan.tooRecentBytes)))"))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("Impact: \(item.regenerationImpact)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
-                    Text(item.exactCommandOrPathDescription)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .textSelection(.enabled)
-                    Text("Impact: \(item.regenerationImpact)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
-                .padding(.vertical, 4)
+
+                if !protectedSkippedItemsInScope.isEmpty {
+                    Section("REVIEW / BLOCKED — Skipped Automatically (\(Formatters.bytes(protectedSkippedBytes)))") {
+                        ForEach(protectedSkippedItemsInScope) { skipped in
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack {
+                                    RiskBadgeView(risk: .review)
+                                    Text("SKIPPED")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.orange.opacity(0.16))
+                                        .foregroundColor(.orange)
+                                        .cornerRadius(4)
+                                    Text(skipped.name)
+                                        .font(.subheadline.weight(.medium))
+                                    Spacer()
+                                    Text(Formatters.bytes(skipped.physicalSize))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundColor(.secondary)
+                                }
+                                Text(skipped.path)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                Text(skipped.explanation)
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
             }
-            .frame(minHeight: 220)
+            .frame(minHeight: 230)
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
             if hasCautionItems {
@@ -167,22 +235,23 @@ public struct CleanupPreviewSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(hasCautionItems ? .red : .accentColor)
-                .disabled(itemsToPreview.isEmpty || (hasCautionItems && !cautionConfirmed))
+                .disabled(itemsToPreview.isEmpty || totalProcessing == 0 || (hasCautionItems && !cautionConfirmed))
             }
         }
         .padding(20)
-        .frame(width: 700, height: 560)
+        .frame(width: 740, height: 580)
     }
 
-    private func riskSummaryCard(risk: RiskLevel, bytes: Int64) -> some View {
-        HStack {
-            RiskBadgeView(risk: risk)
-            Spacer()
+    private func planStatusCard(title: String, bytes: Int64, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundColor(color)
             Text(Formatters.bytes(bytes))
                 .font(.headline.monospacedDigit())
         }
         .padding(10)
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(NSColor.controlBackgroundColor))
         .cornerRadius(8)
     }
