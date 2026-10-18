@@ -58,6 +58,8 @@ public struct ActiveProcessSnapshot: Sendable {
     public let activeLines: [String]
     public let runningAppNames: Set<String>
 
+    public static let empty = ActiveProcessSnapshot(activeLines: [], runningAppNames: [])
+
     public init(activeLines: [String], runningAppNames: Set<String>) {
         self.activeLines = activeLines
         self.runningAppNames = runningAppNames
@@ -87,14 +89,17 @@ public struct ActiveProcessSnapshot: Sendable {
             }
         case .android:
             if checkCommand("qemu-system-aarch64") || checkCommand("qemu-system-x86_64") {
-                matched.insert("qemu-system")
+                matched.insert("qemu-system-aarch64")
             }
-            if checkCommand("Android/sdk/emulator/emulator") || checkApp("Android Studio") {
-                matched.insert("Android Emulator / Studio")
+            if checkCommand("Android/sdk/emulator/emulator") || checkApp("Android Emulator") {
+                matched.insert("Android emulator")
+            }
+            if checkApp("Android Studio") {
+                matched.insert("Android Studio")
             }
         case .gradle:
             if checkCommand("GradleDaemon") || checkCommand("org.gradle.launcher") {
-                matched.insert("Gradle Daemon")
+                matched.insert("Gradle")
             }
         case .nodeNpm:
             if checkCommand("/npm ") || checkCommand("npm-cli.js") {
@@ -102,7 +107,7 @@ public struct ActiveProcessSnapshot: Sendable {
             }
         case .cocoapodsSwiftPM:
             if checkCommand("/pod ") || checkCommand("swift-package") || checkCommand("xcodebuild") {
-                matched.insert("CocoaPods / SwiftPM build")
+                matched.insert("CocoaPods / SwiftPM")
             }
         case .homebrew:
             if checkCommand("/brew ") {
@@ -110,10 +115,13 @@ public struct ActiveProcessSnapshot: Sendable {
             }
         case .docker:
             if checkApp("Docker") || checkCommand("com.docker.backend") || checkCommand("Docker Desktop") {
-                matched.insert("Docker Desktop")
+                matched.insert("Docker")
             }
         case .claude:
-            if checkApp("Claude") || checkCommand("Claude.app") || checkCommand("Claude iOS Sim") {
+            if checkCommand("Claude iOS Sim") || checkApp("Claude iOS Sim") {
+                matched.insert("Claude iOS Sim")
+            }
+            if checkApp("Claude") || checkCommand("Claude.app") {
                 matched.insert("Claude")
             }
         case .codex:
@@ -121,7 +129,7 @@ public struct ActiveProcessSnapshot: Sendable {
                 matched.insert("Codex")
             }
         case .googleAI:
-            if checkCommand("AIEdgeForesight") {
+            if checkCommand("AIEdgeForesight") || checkApp("AIEdgeForesight") || checkCommand("com.google.AIEdgeForesight") {
                 matched.insert("AIEdgeForesight")
             }
         case .generalCaches:

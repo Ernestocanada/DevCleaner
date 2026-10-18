@@ -33,7 +33,6 @@ public struct SafetyValidator: Sendable {
     public let homeDirectory: String
 
     public init(homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path) {
-        // Normalize trailing slash out of homeDirectory
         if homeDirectory.hasSuffix("/") && homeDirectory.count > 1 {
             self.homeDirectory = String(homeDirectory.dropLast())
         } else {
@@ -70,7 +69,6 @@ public struct SafetyValidator: Sendable {
     }
 
     /// Explicitly allowed prefixes where deletion (Trash or subdirectories) is permitted.
-    /// Every cleanable file path MUST either equal one of `allowedExactDirectories` or be a direct/nested child of one of `allowedRootPrefixes`.
     public var allowedRootPrefixes: [String] {
         [
             "\(homeDirectory)/Library/Developer/Xcode/DerivedData",
@@ -115,6 +113,8 @@ public struct SafetyValidator: Sendable {
         ".env.local",
         ".env.production",
         ".ssh",
+        ".gnupg",
+        ".aws",
         ".gitconfig",
         "Keychains",
         "GoogleService-Info.plist",
@@ -123,6 +123,19 @@ public struct SafetyValidator: Sendable {
         "application_default_credentials.json",
         "Docker.raw"
     ]
+
+    public func isForbiddenComponentName(_ comp: String) -> Bool {
+        if forbiddenComponents.contains(comp) {
+            return true
+        }
+        let lower = comp.lowercased()
+        if comp.hasPrefix(".env.") ||
+           (lower.contains("firebase") && lower.contains("credential")) ||
+           (lower.contains("firebase") && lower.hasSuffix(".json")) {
+            return true
+        }
+        return false
+    }
 
     /// Expands tilde if using custom homeDirectory and returns standardized lexical path
     public func expandAndNormalize(_ rawPath: String) throws -> String {
@@ -148,15 +161,17 @@ public struct SafetyValidator: Sendable {
             throw SafetyError.emptyOrInvalidPath
         }
 
-        // Standardize lexically
         let url = URL(fileURLWithPath: expanded)
         var standardized = url.standardizedFileURL.path
         if standardized.hasSuffix("/") && standardized.count > 1 {
             standardized = String(standardized.dropLast())
         }
 
-        // Never allow root or home directory itself
-        if standardized == "/" || standardized == homeDirectory || standardized == "\(homeDirectory)/Library" || standardized == "\(homeDirectory)/Library/Caches" || standardized == "\(homeDirectory)/Library/Application Support" {
+        if standardized == "/" ||
+           standardized == homeDirectory ||
+           standardized == "\(homeDirectory)/Library" ||
+           standardized == "\(homeDirectory)/Library/Caches" ||
+           standardized == "\(homeDirectory)/Library/Application Support" {
             throw SafetyError.forbiddenProtectedPath(standardized)
         }
 
@@ -176,10 +191,7 @@ public struct SafetyValidator: Sendable {
         // 2. Check forbidden components anywhere in path
         let components = normalized.split(separator: "/").map(String.init)
         for comp in components {
-            if forbiddenComponents.contains(comp) {
-                throw SafetyError.forbiddenFileOrComponent(normalized)
-            }
-            if comp.hasPrefix(".env.") || (comp.lowercased().contains("firebase") && comp.lowercased().contains("credential")) || (comp.lowercased().contains("firebase") && comp.lowercased().hasSuffix(".json")) {
+            if isForbiddenComponentName(comp) {
                 throw SafetyError.forbiddenFileOrComponent(normalized)
             }
         }
@@ -216,7 +228,6 @@ public struct SafetyValidator: Sendable {
         if checkSymlinksOnDisk && FileManager.default.fileExists(atPath: normalized) {
             let url = URL(fileURLWithPath: normalized)
             let resolved = url.resolvingSymlinksInPath().path
-            // Note: on macOS /Users is not a symlink, /var -> /private/var
             if resolved != normalized {
                 let resolvedAllowed = allowedRootPrefixes.contains { allowed in
                     let resolvedAllowedPrefix = URL(fileURLWithPath: allowed).resolvingSymlinksInPath().path
@@ -229,6 +240,40 @@ public struct SafetyValidator: Sendable {
         }
 
         return normalized
+    }
+
+    /// Inspects a directory subtree (including hidden files) to verify it does not contain any forbidden components (e.g. .git, .env, credentials) or symlinks escaping the allow-list.
+    public func validateSubtreeForDeletion(_ validatedPath: String) throws {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: validatedPath, isDirectory: &isDir), isDir.boolValue else {
+            return
+        }
+        let rootURL = URL(fileURLWithPath: validatedPath, isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else {
+            return
+        }
+
+        for case let childURL as URL in enumerator {
+            let name = childURL.lastPathComponent
+            if isForbiddenComponentName(name) {
+                throw SafetyError.forbiddenFileOrComponent(childURL.path)
+            }
+            if let vals = try? childURL.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
+                let resolved = childURL.resolvingSymlinksInPath().path
+                let resolvedAllowed = allowedRootPrefixes.contains { allowed in
+                    let resolvedAllowedPrefix = URL(fileURLWithPath: allowed).resolvingSymlinksInPath().path
+                    return resolved == resolvedAllowedPrefix || resolved.hasPrefix(resolvedAllowedPrefix + "/")
+                }
+                if !resolvedAllowed {
+                    throw SafetyError.symlinkTraversalRejected("\(childURL.path) -> \(resolved)")
+                }
+            }
+        }
     }
 
     public func isSafeToDelete(_ rawPath: String, checkSymlinksOnDisk: Bool = true) -> Bool {

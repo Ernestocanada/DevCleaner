@@ -13,7 +13,10 @@ public struct DashboardView: View {
             headerSection
             Divider()
 
-            if let banner = viewModel.statusBannerMessage {
+            if let summary = viewModel.lastCleanupSummary {
+                lastCleanupBanner(summary: summary)
+                Divider()
+            } else if let banner = viewModel.statusBannerMessage {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle.fill")
                         .foregroundColor(.accentColor)
@@ -101,6 +104,67 @@ public struct DashboardView: View {
         }
     }
 
+    private func lastCleanupBanner(summary: CleanupBatchSummary) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 16) {
+                Label("Last Cleanup Completed", systemImage: "checkmark.seal.fill")
+                    .font(.subheadline.bold())
+                    .foregroundColor(.green)
+
+                Text("Processed: \(Formatters.bytes(summary.processedBytes))")
+                    .font(.caption.monospacedDigit().bold())
+
+                Text("Moved to Trash: \(Formatters.bytes(summary.movedToTrashBytes))")
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundColor(.blue)
+
+                Text("Actually Freed Now: \(Formatters.bytes(summary.actuallyFreedBytes))")
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundColor(.green)
+
+                if summary.movedToTrashBytes > 0 {
+                    Text("Empty the macOS Trash to recover the remaining disk space.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    viewModel.openTrashInFinder()
+                } label: {
+                    Label("Show Trash in Finder", systemImage: "trash")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    viewModel.lastCleanupSummary = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            if !summary.blockedMessages.isEmpty {
+                ForEach(summary.blockedMessages, id: \.self) { msg in
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(msg)
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.orange)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color.green.opacity(0.08))
+    }
+
     private var headerSection: some View {
         VStack(spacing: 14) {
             HStack(alignment: .top) {
@@ -137,19 +201,19 @@ public struct DashboardView: View {
                         color: .primary
                     )
                     statMetric(
-                        title: "Potential Reclaimable",
+                        title: "Potential Cleanup (Est.)",
                         value: Formatters.bytes(viewModel.totalReclaimableBytes),
                         color: .accentColor
                     )
                     statMetric(
-                        title: "Selected to Clean",
+                        title: "Selected",
                         value: Formatters.bytes(viewModel.selectedReclaimableBytes),
                         color: .green
                     )
                 }
             }
 
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Button {
                     Task { await viewModel.performScan() }
                 } label: {
@@ -181,12 +245,19 @@ public struct DashboardView: View {
                     }
                 }
                 .pickerStyle(.menu)
-                .frame(width: 210)
+                .frame(width: 200)
                 .onChange(of: viewModel.ageFilter) { _, _ in
                     Task { await viewModel.performScan() }
                 }
 
                 Spacer()
+
+                Button {
+                    viewModel.openTrashInFinder()
+                } label: {
+                    Label("Open Trash", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
 
                 Button {
                     viewModel.showingHistorySheet = true
@@ -265,13 +336,12 @@ public struct CategoryCardView: View {
         items.reduce(0) { $0 + $1.physicalSize }
     }
 
-    private var totalReclaimable: Int64 {
+    private var totalPotentialCleanup: Int64 {
         items.filter { $0.riskLevel != .neverDelete }.reduce(0) { $0 + $1.reclaimableSize }
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Card Header
             HStack(spacing: 10) {
                 Button(action: onToggleExpand) {
                     HStack(spacing: 8) {
@@ -291,7 +361,7 @@ public struct CategoryCardView: View {
                 if let activeProcs = items.first?.runningProcessNames, !activeProcs.isEmpty, category != .iosSimulators {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                        Text("Close application before cleaning (\(activeProcs.joined(separator: ", ")))")
+                        Text("Cleanup blocked: Close \(activeProcs.joined(separator: ", ")) before cleaning")
                     }
                     .font(.caption.bold())
                     .foregroundColor(.orange)
@@ -304,7 +374,7 @@ public struct CategoryCardView: View {
                 Spacer()
 
                 if category == .iosSimulators {
-                    Button("Manage Runtimes (Advanced)") {
+                    Button("Advanced: Manage Runtimes") {
                         viewModel.showingRuntimesSheet = true
                     }
                     .controlSize(.small)
@@ -315,9 +385,9 @@ public struct CategoryCardView: View {
                     .font(.subheadline.monospacedDigit())
                     .foregroundColor(.secondary)
 
-                Text("Reclaimable: \(Formatters.bytes(totalReclaimable))")
+                Text("Potential Cleanup: \(Formatters.bytes(totalPotentialCleanup))")
                     .font(.subheadline.monospacedDigit().bold())
-                    .foregroundColor(totalReclaimable > 0 ? .primary : .secondary)
+                    .foregroundColor(totalPotentialCleanup > 0 ? .primary : .secondary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -355,7 +425,6 @@ public struct CleanableItemRow: View {
 
     public var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            // Checkbox
             Toggle("", isOn: Binding(
                 get: { isSelected },
                 set: { _ in viewModel.toggleSelection(for: item) }
@@ -372,30 +441,30 @@ public struct CleanableItemRow: View {
                     RiskBadgeView(risk: item.riskLevel)
 
                     if let sim = item.simulatorMetadata {
-                        Text(sim.state.uppercased())
+                        Text(sim.displayBadgeText)
                             .font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(sim.state == "Booted" ? Color.green.opacity(0.18) : Color.secondary.opacity(0.15))
-                            .foregroundColor(sim.state == "Booted" ? .green : .secondary)
+                            .background(sim.isBooted ? Color.green.opacity(0.18) : Color.secondary.opacity(0.15))
+                            .foregroundColor(sim.isBooted ? .green : .secondary)
                             .cornerRadius(4)
                     }
 
-                    if item.isRunningDependency {
-                        Text("Close application before cleaning")
+                    if item.isRunningDependency && item.simulatorMetadata == nil {
+                        let procText = item.runningProcessNames.isEmpty ? item.category.rawValue : item.runningProcessNames.joined(separator: ", ")
+                        Text("Close \(procText) before cleaning")
                             .font(.caption2.bold())
                             .foregroundColor(.orange)
                     }
 
                     Spacer()
 
-                    // Size & Reclaimable
                     VStack(alignment: .trailing, spacing: 2) {
                         if item.hasSparseDifference {
                             HStack(spacing: 6) {
-                                Text("Physical: \(Formatters.bytes(item.physicalSize))")
+                                Text("Physical disk usage: \(Formatters.bytes(item.physicalSize))")
                                     .font(.subheadline.monospacedDigit().bold())
-                                Text("(Logical sparse: \(Formatters.bytes(item.logicalSize)))")
+                                Text("(Logical sparse size: \(Formatters.bytes(item.logicalSize)))")
                                     .font(.caption.monospacedDigit())
                                     .foregroundColor(.secondary)
                             }
@@ -404,7 +473,7 @@ public struct CleanableItemRow: View {
                                 Text(Formatters.bytes(item.physicalSize))
                                     .font(.subheadline.monospacedDigit().bold())
                                 if item.reclaimableSize != item.physicalSize && item.riskLevel != .neverDelete {
-                                    Text("(Reclaimable: \(Formatters.bytes(item.reclaimableSize)))")
+                                    Text("(Potential: \(Formatters.bytes(item.reclaimableSize)))")
                                         .font(.caption.monospacedDigit())
                                         .foregroundColor(.accentColor)
                                 }
@@ -416,14 +485,14 @@ public struct CleanableItemRow: View {
                         }
 
                         if let mod = item.lastModified {
-                            Text("Modified \(Formatters.relativeDate(mod))")
+                            Text("Last activity: \(Formatters.relativeDate(mod))")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
                     }
                 }
 
-                Text(item.path)
+                Text(item.exactCommandOrPathDescription)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
                     .textSelection(.enabled)
@@ -433,19 +502,18 @@ public struct CleanableItemRow: View {
                     .foregroundColor(.primary.opacity(0.85))
 
                 HStack(spacing: 12) {
-                    Text("After cleanup: \(item.deletionConsequence)")
+                    Text("Action: \(item.deletionConsequence)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                     Text("•")
                         .font(.caption2)
                         .foregroundColor(.secondary)
-                    Text("Regeneration: \(item.regenerationImpact)")
+                    Text("Impact: \(item.regenerationImpact)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
             }
 
-            // Action Buttons (Inspect & Clean)
             VStack(alignment: .trailing, spacing: 6) {
                 Button {
                     viewModel.inspectInFinder(item)

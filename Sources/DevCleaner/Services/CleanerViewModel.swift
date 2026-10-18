@@ -14,6 +14,7 @@ public final class CleanerViewModel: ObservableObject {
     @Published public var historyEntries: [CleanupHistoryEntry] = []
     @Published public var simulatorRuntimes: [SimulatorRuntimeInfo] = []
     @Published public var statusBannerMessage: String? = nil
+    @Published public var lastCleanupSummary: CleanupBatchSummary? = nil
 
     // Sheet states
     @Published public var showingPreviewSheet: Bool = false
@@ -46,7 +47,6 @@ public final class CleanerViewModel: ObservableObject {
     public func performScan() async {
         guard !isScanning else { return }
         isScanning = true
-        statusBannerMessage = nil
 
         let currentFilter = ageFilter
         let snapshot = await ProcessMonitor.shared.captureSnapshot()
@@ -67,7 +67,6 @@ public final class CleanerViewModel: ObservableObject {
         let simCleaner = SimulatorCleaner()
         let runtimes = await simCleaner.fetchRuntimes()
 
-        // Sort items predictably by category order then physical size descending
         let categoryOrder = CleanerCategory.allCases
         allScanned.sort { a, b in
             let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
@@ -81,7 +80,6 @@ public final class CleanerViewModel: ObservableObject {
         self.freeSpaceBytes = freeBytes
         self.lastScanDate = Date()
 
-        // Keep valid selections or default to SAFE items if first scan
         let validSelectableIDs = Set(allScanned.filter { $0.canBeSelected }.map { $0.id })
         if selectedIDs.isEmpty {
             selectRecommendedSafeItems()
@@ -99,13 +97,14 @@ public final class CleanerViewModel: ObservableObject {
                 .filter { $0.riskLevel == .safe && $0.canBeSelected && $0.reclaimableSize > 0 }
                 .map { $0.id }
         )
-        statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items and models are excluded."
+        statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items, simulators, VMs, and AI models are excluded."
     }
 
     public func activateDevelopmentCleanupMode(filter: AgeFilter = .sevenDays) {
         developmentModeActive = true
-        if ageFilter != filter {
-            ageFilter = filter
+        let targetFilter = (filter == .all) ? .sevenDays : filter
+        if ageFilter != targetFilter {
+            ageFilter = targetFilter
             Task {
                 await performScan()
                 self.selectedIDs = Set(
@@ -113,7 +112,7 @@ public final class CleanerViewModel: ObservableObject {
                         .filter { $0.riskLevel == .safe && $0.canBeSelected && $0.reclaimableSize > 0 }
                         .map { $0.id }
                 )
-                self.statusBannerMessage = "Daily Development Cleanup (\(filter.title)): selected SAFE caches (\(Formatters.bytes(self.selectedReclaimableBytes)))."
+                self.statusBannerMessage = "Development Cleanup (\(targetFilter.title)): selected SAFE caches older than threshold (\(Formatters.bytes(self.selectedReclaimableBytes)))."
             }
         } else {
             selectedIDs = Set(
@@ -121,7 +120,7 @@ public final class CleanerViewModel: ObservableObject {
                     .filter { $0.riskLevel == .safe && $0.canBeSelected && $0.reclaimableSize > 0 }
                     .map { $0.id }
             )
-            statusBannerMessage = "Daily Development Cleanup (\(filter.title)): selected SAFE caches (\(Formatters.bytes(selectedReclaimableBytes)))."
+            statusBannerMessage = "Development Cleanup (\(targetFilter.title)): selected SAFE caches older than threshold (\(Formatters.bytes(selectedReclaimableBytes)))."
         }
     }
 
@@ -136,6 +135,10 @@ public final class CleanerViewModel: ObservableObject {
 
     public var totalReclaimableBytes: Int64 {
         items.filter { $0.riskLevel != .neverDelete }.reduce(0) { $0 + $1.reclaimableSize }
+    }
+
+    public func potentialBytes(for risk: RiskLevel) -> Int64 {
+        items.filter { $0.riskLevel == risk }.reduce(0) { $0 + $1.reclaimableSize }
     }
 
     public var selectedItems: [CleanableItem] {
@@ -175,28 +178,51 @@ public final class CleanerViewModel: ObservableObject {
         }
     }
 
+    public func openTrashInFinder() {
+        if let trashURL = FileManager.default.urls(for: .trashDirectory, in: .userDomainMask).first {
+            NSWorkspace.shared.open(trashURL)
+        } else {
+            let fallback = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+            NSWorkspace.shared.open(fallback)
+        }
+    }
+
     public func executeCleanup(for targetItems: [CleanableItem]) async {
         guard !targetItems.isEmpty, !isCleaning else { return }
         isCleaning = true
         defer { isCleaning = false }
 
-        // Re-verify process snapshot right before executing
-        let latestSnapshot = await ProcessMonitor.shared.captureSnapshot()
-
-        var totalReclaimed: Int64 = 0
+        let overallFreeBefore = DiskScanner.shared.freeDiskSpaceBytes()
+        var totalProcessed: Int64 = 0
+        var totalMovedToTrash: Int64 = 0
+        var totalItemFreedDelta: Int64 = 0
         var successCount = 0
         var failCount = 0
+        var blockedMessages: [String] = []
 
         for item in targetItems {
+            // Re-evaluate live process state immediately before each item's destructive operation
+            let latestSnapshot = await ProcessMonitor.shared.captureSnapshot()
             let activeProcs = latestSnapshot.matchingProcesses(for: item.category)
-            if !activeProcs.isEmpty || item.isRunningDependency {
-                let msg = "Skipped: Close active application (\(activeProcs.joined(separator: ", "))) before cleaning."
+            let isDockerPrune: Bool = {
+                if case .dockerPrune = item.actionType { return true }
+                return false
+            }()
+
+            if (!activeProcs.isEmpty && !isDockerPrune) || item.isRunningDependency {
+                let procLabel = !activeProcs.isEmpty
+                    ? activeProcs.joined(separator: ", ")
+                    : (item.runningProcessNames.isEmpty ? item.category.rawValue : item.runningProcessNames.joined(separator: ", "))
+                let msg = "Cleanup blocked: Close \(procLabel) before cleaning \(item.category.rawValue) runtime data."
+                blockedMessages.append(msg)
                 let entry = CleanupHistoryEntry(
                     category: item.category.rawValue,
                     itemName: item.name,
-                    path: item.path,
-                    bytesReclaimed: 0,
-                    actionDescription: describeAction(item.actionType),
+                    path: item.exactCommandOrPathDescription,
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    actionDescription: item.actionKind.rawValue,
                     success: false,
                     message: msg
                 )
@@ -206,74 +232,95 @@ public final class CleanerViewModel: ObservableObject {
             }
 
             do {
-                let bytes = try await executor.execute(item, ageFilter: ageFilter)
-                totalReclaimed += bytes
+                let result = try await executor.execute(item, ageFilter: ageFilter)
+                totalProcessed += result.processedBytes
+                totalMovedToTrash += result.movedToTrashBytes
+                totalItemFreedDelta += result.actuallyFreedBytes
                 successCount += 1
+
+                let note: String = {
+                    if result.action == .moveToTrash {
+                        return "Moved to macOS Trash (\(Formatters.bytes(result.movedToTrashBytes))). Empty Trash to recover disk space."
+                    }
+                    return "Executed (\(result.action.rawValue))"
+                }()
+
                 let entry = CleanupHistoryEntry(
                     category: item.category.rawValue,
                     itemName: item.name,
-                    path: item.path,
-                    bytesReclaimed: bytes,
-                    actionDescription: describeAction(item.actionType),
+                    path: item.exactCommandOrPathDescription,
+                    processedBytes: result.processedBytes,
+                    movedToTrashBytes: result.movedToTrashBytes,
+                    actuallyFreedBytes: result.actuallyFreedBytes,
+                    actionDescription: result.action.rawValue,
                     success: true,
-                    message: "Successfully cleaned"
+                    message: note
                 )
                 CleanupHistoryStore.shared.appendEntry(entry)
                 selectedIDs.remove(item.id)
             } catch {
                 failCount += 1
+                let errText = error.localizedDescription
+                blockedMessages.append(errText)
                 let entry = CleanupHistoryEntry(
                     category: item.category.rawValue,
                     itemName: item.name,
-                    path: item.path,
-                    bytesReclaimed: 0,
-                    actionDescription: describeAction(item.actionType),
+                    path: item.exactCommandOrPathDescription,
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    actionDescription: item.actionKind.rawValue,
                     success: false,
-                    message: error.localizedDescription
+                    message: errText
                 )
                 CleanupHistoryStore.shared.appendEntry(entry)
             }
         }
 
+        let overallFreeAfter = DiskScanner.shared.freeDiskSpaceBytes()
+        let measuredOverallDelta = max(0, overallFreeAfter - overallFreeBefore)
+        let effectiveFreed = max(measuredOverallDelta, totalItemFreedDelta)
+
+        self.lastCleanupSummary = CleanupBatchSummary(
+            date: Date(),
+            processedBytes: totalProcessed,
+            movedToTrashBytes: totalMovedToTrash,
+            actuallyFreedBytes: effectiveFreed,
+            succeededCount: successCount,
+            failedOrBlockedCount: failCount,
+            blockedMessages: blockedMessages
+        )
         self.historyEntries = CleanupHistoryStore.shared.loadEntries()
-        self.statusBannerMessage = "Cleanup finished: reclaimed \(Formatters.bytes(totalReclaimed)) (\(successCount) succeeded, \(failCount) skipped/failed)."
+
+        if !blockedMessages.isEmpty && successCount == 0 {
+            self.statusBannerMessage = blockedMessages.first
+        } else {
+            self.statusBannerMessage = "Cleanup completed — Processed: \(Formatters.bytes(totalProcessed)) • Moved to Trash: \(Formatters.bytes(totalMovedToTrash)) • Disk freed now: \(Formatters.bytes(effectiveFreed))."
+        }
+
         await performScan()
     }
 
     public func deleteSimulatorRuntime(_ runtime: SimulatorRuntimeInfo) async {
+        let freeBefore = DiskScanner.shared.freeDiskSpaceBytes()
         let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "runtime", "delete", runtime.id])
+        let freeAfter = DiskScanner.shared.freeDiskSpaceBytes()
+        let delta = max(0, freeAfter - freeBefore)
+
         let entry = CleanupHistoryEntry(
             category: CleanerCategory.iosSimulators.rawValue,
             itemName: "Runtime \(runtime.name)",
-            path: "/Library/Developer/CoreSimulator/Volumes",
-            bytesReclaimed: 0,
-            actionDescription: "xcrun simctl runtime delete \(runtime.id)",
+            path: "xcrun simctl runtime delete \(runtime.id)",
+            processedBytes: delta,
+            movedToTrashBytes: 0,
+            actuallyFreedBytes: delta,
+            actionDescription: CleanupResultAction.simctlDelete.rawValue,
             success: res.isSuccess,
-            message: res.isSuccess ? "Runtime deleted" : res.stderr
+            message: res.isSuccess ? "Runtime deleted via simctl" : res.stderr
         )
         CleanupHistoryStore.shared.appendEntry(entry)
         self.historyEntries = CleanupHistoryStore.shared.loadEntries()
         await performScan()
-    }
-
-    private func describeAction(_ action: CleanupActionType) -> String {
-        switch action {
-        case .moveToTrash:
-            return "Move to Trash"
-        case .moveToTrashContents(_, let days):
-            if let d = days { return "Move contents older than \(d)d to Trash" }
-            return "Move cache contents to Trash"
-        case .simctlDeleteDevice(let udid):
-            return "xcrun simctl delete \(udid)"
-        case .simctlDeleteUnavailable:
-            return "xcrun simctl delete unavailable"
-        case .simctlDeleteRuntime(let id):
-            return "xcrun simctl runtime delete \(id)"
-        case .dockerPrune(let args):
-            return "docker \(args.joined(separator: " "))"
-        case .readOnlyInfo:
-            return "Read-only info"
-        }
     }
 }
 

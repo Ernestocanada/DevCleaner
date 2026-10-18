@@ -14,6 +14,13 @@ public struct CleanupHistorySheet: View {
                 Label("Local Cleanup History", systemImage: "clock.arrow.circlepath")
                     .font(.title3.bold())
                 Spacer()
+                Button {
+                    viewModel.openTrashInFinder()
+                } label: {
+                    Label("Open Trash in Finder", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
@@ -35,7 +42,7 @@ public struct CleanupHistorySheet: View {
                 .frame(maxWidth: .infinity)
             } else {
                 List(viewModel.historyEntries) { entry in
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Image(systemName: entry.success ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                 .foregroundColor(entry.success ? .green : .orange)
@@ -45,37 +52,56 @@ public struct CleanupHistorySheet: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                             Spacer()
-                            Text(Formatters.bytes(entry.bytesReclaimed))
-                                .font(.subheadline.monospacedDigit().bold())
                             Text(entry.date.formatted(date: .abbreviated, time: .shortened))
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                        Text("\(entry.actionDescription) — \(entry.path)")
+
+                        HStack(spacing: 16) {
+                            Text("Action: \(entry.actionDescription)")
+                                .font(.caption.weight(.semibold))
+                            Text("Processed: \(Formatters.bytes(entry.processedBytes))")
+                                .font(.caption.monospacedDigit())
+                            Text("Moved to Trash: \(Formatters.bytes(entry.movedToTrashBytes))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundColor(.blue)
+                            Text("Disk Freed Delta: \(Formatters.bytes(entry.actuallyFreedBytes))")
+                                .font(.caption.monospacedDigit().bold())
+                                .foregroundColor(.green)
+                        }
+
+                        Text(entry.path)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+
                         if let msg = entry.message, !msg.isEmpty {
                             Text(msg)
                                 .font(.caption)
                                 .foregroundColor(entry.success ? .secondary : .orange)
                         }
                     }
-                    .padding(.vertical, 3)
+                    .padding(.vertical, 4)
                 }
             }
         }
         .padding(20)
-        .frame(width: 680, height: 440)
+        .frame(width: 740, height: 480)
     }
 }
 
 public struct SimulatorRuntimesSheet: View {
     @ObservedObject var viewModel: CleanerViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var selectedRuntimeID: String? = nil
     @State private var runtimeToConfirmDelete: SimulatorRuntimeInfo? = nil
 
     public init(viewModel: CleanerViewModel) {
         self.viewModel = viewModel
+    }
+
+    private var selectedRuntime: SimulatorRuntimeInfo? {
+        viewModel.simulatorRuntimes.first { $0.id == selectedRuntimeID }
     }
 
     public var body: some View {
@@ -85,9 +111,9 @@ public struct SimulatorRuntimesSheet: View {
                     .foregroundColor(.red)
                     .font(.title2)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Simulator Runtime Manager (Advanced)")
+                    Text("Advanced Simulator Runtime Manager")
                         .font(.title3.bold())
-                    Text("Mounted runtime images in /Library/Developer/CoreSimulator/Volumes. iOS 26.3 & iOS 27.0 are preserved by default.")
+                    Text("Mounted runtime images in /Library/Developer/CoreSimulator/Volumes. iOS 26.3 & iOS 27.0 are PRESERVED by default.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -98,21 +124,30 @@ public struct SimulatorRuntimesSheet: View {
             HStack(spacing: 10) {
                 Image(systemName: "info.circle.fill")
                     .foregroundColor(.orange)
-                Text("STRONG WARNING: Deleting an iOS Simulator Runtime requires re-downloading 8–15 GB from Apple if you need to run simulators on that iOS version again. Never delete runtime folders manually in Finder.")
+                Text("STRONG WARNING: Deleting an iOS Simulator Runtime requires re-downloading 8–15 GB from Apple if you need to run simulators on that iOS version again. Never delete runtime folders manually in Finder. Runtimes are never included in Recommended or Development Cleanup.")
                     .font(.caption)
             }
             .padding(10)
             .background(Color.orange.opacity(0.12))
             .cornerRadius(8)
 
-            List(viewModel.simulatorRuntimes) { rt in
+            Text("Step 1: Explicitly select a runtime below:")
+                .font(.caption.bold())
+                .foregroundColor(.secondary)
+
+            List(viewModel.simulatorRuntimes, selection: $selectedRuntimeID) { rt in
                 HStack {
+                    Image(systemName: selectedRuntimeID == rt.id ? "checkmark.circle.fill" : "circle")
+                        .foregroundColor(selectedRuntimeID == rt.id ? .accentColor : .secondary)
+                        .onTapGesture {
+                            selectedRuntimeID = rt.id
+                        }
                     VStack(alignment: .leading, spacing: 3) {
-                        HStack {
+                        HStack(spacing: 8) {
                             Text(rt.name)
                                 .font(.headline)
                             if rt.isPreservedByDefault {
-                                Text("PRESERVED BY DEFAULT")
+                                Text("PRESERVED")
                                     .font(.system(size: 10, weight: .bold))
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
@@ -126,18 +161,42 @@ public struct SimulatorRuntimesSheet: View {
                             .foregroundColor(.secondary)
                     }
                     Spacer()
-                    Button(role: .destructive) {
-                        runtimeToConfirmDelete = rt
-                    } label: {
-                        Text("Delete via simctl...")
-                    }
-                    .buttonStyle(.bordered)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    selectedRuntimeID = rt.id
                 }
                 .padding(.vertical, 4)
             }
+
+            HStack {
+                if let sel = selectedRuntime {
+                    Text("Selected: \(sel.name) (\(sel.id))")
+                        .font(.caption.weight(.medium))
+                } else {
+                    Text("No runtime selected.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button(role: .destructive) {
+                    if let sel = selectedRuntime {
+                        runtimeToConfirmDelete = sel
+                    }
+                } label: {
+                    if let sel = selectedRuntime {
+                        Text("Remove \(sel.name) via simctl...")
+                    } else {
+                        Text("Select a Runtime to Remove...")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(selectedRuntime == nil)
+            }
         }
         .padding(20)
-        .frame(width: 640, height: 380)
+        .frame(width: 680, height: 420)
         .alert(
             "Delete Simulator Runtime?",
             isPresented: Binding(
@@ -149,12 +208,13 @@ public struct SimulatorRuntimesSheet: View {
             Button("Cancel", role: .cancel) { runtimeToConfirmDelete = nil }
             Button("Delete \(rt.name)", role: .destructive) {
                 runtimeToConfirmDelete = nil
+                selectedRuntimeID = nil
                 Task {
                     await viewModel.deleteSimulatorRuntime(rt)
                 }
             }
         } message: { rt in
-            Text("Are you sure you want to run 'xcrun simctl runtime delete \(rt.id)'? You will have to re-download \(rt.name) in Xcode to use it again.")
+            Text("Confirm destructive removal of runtime '\(rt.name)' via 'xcrun simctl runtime delete \(rt.id)'. You will have to re-download \(rt.name) (8–15 GB) in Xcode if needed again.")
         }
     }
 }
