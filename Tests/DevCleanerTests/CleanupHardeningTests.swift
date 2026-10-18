@@ -41,7 +41,8 @@ final class CleanupHardeningTests: XCTestCase {
     private func makeIsolatedExecutor(
         simulatedFreeBefore: Int64 = 100_000_000_000,
         simulatedFreeAfter: Int64 = 100_000_000_000,
-        activeProcesses: [CleanerCategory: [String]] = [:]
+        activeProcesses: [CleanerCategory: [String]] = [:],
+        shellRunner: (@Sendable (String, [String]) async -> ShellResult)? = nil
     ) -> CleanupExecutor {
         let trashDir = self.tempTrash!
         let counter = LockCounter()
@@ -56,6 +57,9 @@ final class CleanupHardeningTests: XCTestCase {
             trashHandler: { url in
                 let dest = trashDir.appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
                 try FileManager.default.moveItem(at: url, to: dest)
+            },
+            shellRunner: shellRunner ?? { _, _ in
+                ShellResult(exitCode: 1, stdout: "", stderr: "Unmocked shell command blocked in isolated unit test")
             }
         )
     }
@@ -851,6 +855,343 @@ final class CleanupHardeningTests: XCTestCase {
         XCTAssertGreaterThan(result.movedToTrashBytes, 0)
         XCTAssertEqual(result.actuallyFreedBytes, 0, "Per-item actuallyFreedBytes for moveToTrash must be 0 and never attribute unrelated APFS fluctuations")
     }
+
+    // MARK: - 7. v1.3 Per-Device Simulator Execution Safety Tests
+
+    func testShutdownSimulatorDeletableWhileAnotherSimulatorIsBooted() async throws {
+        let fixtureJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+              {
+                "udid": "83050079-F7C5-4F34-AD3A-E6CBF1130330",
+                "name": "iPhone 18 Pro",
+                "state": "Booted",
+                "isAvailable": true,
+                "dataPath": "/Users/ernesto/Library/Developer/CoreSimulator/Devices/83050079-F7C5-4F34-AD3A-E6CBF1130330/data",
+                "dataPathSize": 5192871936,
+                "logPathSize": 544768
+              },
+              {
+                "udid": "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD",
+                "name": "iPhone 18 Pro Max",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPath": "/Users/ernesto/Library/Developer/CoreSimulator/Devices/D0DD3D55-733A-4D23-9A25-B310BDB9D0CD/data",
+                "dataPathSize": 3339337728,
+                "logPathSize": 49152
+              }
+            ]
+          }
+        }
+        """
+
+        let items = try SimulatorCleaner.parseDevicesJSON(fixtureJSON.data(using: .utf8)!, homeDirectory: tempHome.path)
+        let shutdownTarget = try XCTUnwrap(items.first { $0.id == "sim-device-D0DD3D55-733A-4D23-9A25-B310BDB9D0CD" })
+        let bootedOther = try XCTUnwrap(items.first { $0.id == "sim-device-83050079-F7C5-4F34-AD3A-E6CBF1130330" })
+
+        XCTAssertEqual(shutdownTarget.riskLevel, .review)
+        XCTAssertEqual(shutdownTarget.simulatorMetadata?.displayBadgeText, "SHUTDOWN")
+        XCTAssertTrue(shutdownTarget.canBeSelected, "Shutdown simulator must remain selectable/cleanable when another simulator is Booted")
+        XCTAssertFalse(bootedOther.canBeSelected, "Booted simulator must remain non-selectable")
+
+        let recorder = CommandRecorder()
+        let executor = makeIsolatedExecutor(
+            simulatedFreeBefore: 100_000_000_000,
+            simulatedFreeAfter: 103_339_386_880,
+            activeProcesses: [.iosSimulators: ["Simulator"]],
+            shellRunner: { executable, args in
+                recorder.record(executable: executable, arguments: args)
+                if args == ["simctl", "list", "devices", "-j"] {
+                    return ShellResult(exitCode: 0, stdout: fixtureJSON, stderr: "")
+                }
+                if args == ["simctl", "delete", "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD"] {
+                    return ShellResult(exitCode: 0, stdout: "", stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Unexpected command: \(args)")
+            }
+        )
+
+        let result = try await executor.execute(shutdownTarget)
+        XCTAssertEqual(result.status, .cleaned)
+        XCTAssertEqual(result.action, .simctlDelete)
+        XCTAssertEqual(result.processedBytes, shutdownTarget.reclaimableSize)
+        XCTAssertEqual(recorder.calls, [
+            ["/usr/bin/xcrun", "simctl", "list", "devices", "-j"],
+            ["/usr/bin/xcrun", "simctl", "delete", "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD"]
+        ])
+    }
+
+    func testBootedSimulatorDeletionIsBlocked() async throws {
+        let fixtureJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+              {
+                "udid": "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD",
+                "name": "iPhone 18 Pro Max",
+                "state": "Booted",
+                "isAvailable": true,
+                "dataPathSize": 3339337728,
+                "logPathSize": 49152
+              }
+            ]
+          }
+        }
+        """
+
+        let items = try SimulatorCleaner.parseDevicesJSON(fixtureJSON.data(using: .utf8)!, homeDirectory: tempHome.path)
+        let bootedTarget = try XCTUnwrap(items.first { $0.id == "sim-device-D0DD3D55-733A-4D23-9A25-B310BDB9D0CD" })
+        XCTAssertEqual(bootedTarget.simulatorMetadata?.displayBadgeText, "ACTIVE — protected")
+        XCTAssertFalse(bootedTarget.canBeSelected)
+
+        let recorder = CommandRecorder()
+        let executor = makeIsolatedExecutor(
+            activeProcesses: [.iosSimulators: ["Simulator"]],
+            shellRunner: { executable, args in
+                recorder.record(executable: executable, arguments: args)
+                if args == ["simctl", "list", "devices", "-j"] {
+                    return ShellResult(exitCode: 0, stdout: fixtureJSON, stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Should never call simctl delete on Booted device")
+            }
+        )
+
+        do {
+            _ = try await executor.execute(bootedTarget)
+            XCTFail("Expected simulatorDeviceActive error for Booted target")
+        } catch let error as CleanerError {
+            XCTAssertEqual(error, .simulatorDeviceActive(deviceName: "iPhone 18 Pro Max", state: "Booted"))
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Cleanup blocked: iPhone 18 Pro Max is currently active.\nShut down this simulator before deleting it."
+            )
+        }
+
+        XCTAssertEqual(recorder.calls, [
+            ["/usr/bin/xcrun", "simctl", "list", "devices", "-j"]
+        ], "simctl delete must never be invoked for a Booted device")
+    }
+
+    func testTargetSimulatorChangesFromShutdownToBootedAfterScanIsBlockedByImmediateRecheck() async throws {
+        let scanTimeJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+              {
+                "udid": "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD",
+                "name": "iPhone 18 Pro Max",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 3339337728,
+                "logPathSize": 49152
+              }
+            ]
+          }
+        }
+        """
+
+        // User boots iPhone 18 Pro Max after scanning, before clicking Clean
+        let executeTimeJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+              {
+                "udid": "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD",
+                "name": "iPhone 18 Pro Max",
+                "state": "Booted",
+                "isAvailable": true,
+                "dataPathSize": 3339337728,
+                "logPathSize": 49152
+              }
+            ]
+          }
+        }
+        """
+
+        let scannedItems = try SimulatorCleaner.parseDevicesJSON(scanTimeJSON.data(using: .utf8)!, homeDirectory: tempHome.path)
+        let scannedAsShutdown = try XCTUnwrap(scannedItems.first { $0.id == "sim-device-D0DD3D55-733A-4D23-9A25-B310BDB9D0CD" })
+        XCTAssertFalse(scannedAsShutdown.isRunningDependency)
+        XCTAssertTrue(scannedAsShutdown.canBeSelected)
+
+        let recorder = CommandRecorder()
+        let executor = makeIsolatedExecutor(
+            activeProcesses: [.iosSimulators: ["Simulator"]],
+            shellRunner: { executable, args in
+                recorder.record(executable: executable, arguments: args)
+                if args == ["simctl", "list", "devices", "-j"] {
+                    return ShellResult(exitCode: 0, stdout: executeTimeJSON, stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Must never execute simctl delete when live recheck shows Booted")
+            }
+        )
+
+        do {
+            _ = try await executor.execute(scannedAsShutdown)
+            XCTFail("Expected immediate recheck to block deletion when target became Booted after scan")
+        } catch let error as CleanerError {
+            XCTAssertEqual(error, .simulatorDeviceActive(deviceName: "iPhone 18 Pro Max", state: "Booted"))
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Cleanup blocked: iPhone 18 Pro Max is currently active.\nShut down this simulator before deleting it."
+            )
+        }
+
+        XCTAssertEqual(recorder.calls, [
+            ["/usr/bin/xcrun", "simctl", "list", "devices", "-j"]
+        ], "Executor must re-query simctl list devices -j and abort before simctl delete")
+    }
+
+    func testTargetSimulatorDisappearsBeforeExecutionReturnsGracefulNothingEligible() async throws {
+        let scanTimeJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+              {
+                "udid": "D0DD3D55-733A-4D23-9A25-B310BDB9D0CD",
+                "name": "iPhone 18 Pro Max",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 3339337728,
+                "logPathSize": 49152
+              }
+            ]
+          }
+        }
+        """
+
+        let emptyDevicesJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0": []
+          }
+        }
+        """
+
+        let scannedItems = try SimulatorCleaner.parseDevicesJSON(scanTimeJSON.data(using: .utf8)!, homeDirectory: tempHome.path)
+        let targetItem = try XCTUnwrap(scannedItems.first { $0.id == "sim-device-D0DD3D55-733A-4D23-9A25-B310BDB9D0CD" })
+
+        let recorder = CommandRecorder()
+        let executor = makeIsolatedExecutor(
+            shellRunner: { executable, args in
+                recorder.record(executable: executable, arguments: args)
+                if args == ["simctl", "list", "devices", "-j"] {
+                    return ShellResult(exitCode: 0, stdout: emptyDevicesJSON, stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Must not call simctl delete when device no longer exists")
+            }
+        )
+
+        let result = try await executor.execute(targetItem)
+        XCTAssertEqual(result.status, .nothingEligible)
+        XCTAssertEqual(result.processedBytes, 0)
+        XCTAssertEqual(result.actuallyFreedBytes, 0)
+        XCTAssertEqual(recorder.calls, [
+            ["/usr/bin/xcrun", "simctl", "list", "devices", "-j"]
+        ])
+    }
+
+    func testMalformedSimulatorUDIDIsRejectedBeforeAnySimctlInvocation() async throws {
+        let recorder = CommandRecorder()
+        let executor = makeIsolatedExecutor(
+            shellRunner: { executable, args in
+                recorder.record(executable: executable, arguments: args)
+                return ShellResult(exitCode: 0, stdout: "{}", stderr: "")
+            }
+        )
+
+        for invalidUDID in ["../../not-a-uuid", "not-a-valid-udid", "12345", ""] {
+            let malformedItem = CleanableItem(
+                id: "bad-udid-\(invalidUDID)",
+                name: "Malformed Sim",
+                category: .iosSimulators,
+                path: "",
+                logicalSize: 100,
+                physicalSize: 100,
+                reclaimableSize: 100,
+                lastModified: nil,
+                riskLevel: .review,
+                explanation: "",
+                deletionConsequence: "",
+                regenerationImpact: "",
+                isRunningDependency: false,
+                actionType: .simctlDeleteDevice(udid: invalidUDID)
+            )
+
+            do {
+                _ = try await executor.execute(malformedItem)
+                XCTFail("Expected commandFailed for malformed UDID: \(invalidUDID)")
+            } catch let error as CleanerError {
+                guard case .commandFailed = error else {
+                    XCTFail("Expected commandFailed, got \(error)")
+                    return
+                }
+            }
+        }
+
+        XCTAssertTrue(recorder.calls.isEmpty, "No shell command may be executed when UDID is malformed")
+    }
+
+    func testRuntimeAndUnavailableDeletionProtectionsRemainUnchangedWhenSimulatorIsActive() async throws {
+        let recorder = CommandRecorder()
+        let executor = makeIsolatedExecutor(
+            activeProcesses: [.iosSimulators: ["Simulator"]],
+            shellRunner: { executable, args in
+                recorder.record(executable: executable, arguments: args)
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            }
+        )
+
+        let runtimeItem = CleanableItem(
+            id: "sim-runtime-ios18",
+            name: "Runtime iOS 18.0",
+            category: .iosSimulators,
+            path: "/Library/Developer/CoreSimulator/Volumes",
+            logicalSize: 8_000_000_000,
+            physicalSize: 8_000_000_000,
+            reclaimableSize: 8_000_000_000,
+            lastModified: nil,
+            riskLevel: .caution,
+            explanation: "",
+            deletionConsequence: "",
+            regenerationImpact: "",
+            isRunningDependency: false,
+            actionType: .simctlDeleteRuntime(identifier: "com.apple.CoreSimulator.SimRuntime.iOS-18-0")
+        )
+
+        do {
+            _ = try await executor.execute(runtimeItem)
+            XCTFail("Expected runningProcessActive when deleting a simulator runtime while Simulator is running")
+        } catch let error as CleanerError {
+            XCTAssertEqual(error, .runningProcessActive(appName: "Simulator", categoryName: "iOS Simulators"))
+        }
+
+        let unavailableItem = CleanableItem(
+            id: "sim-delete-unavailable",
+            name: "Delete Unavailable Simulators",
+            category: .iosSimulators,
+            path: "\(tempHome.path)/Library/Developer/CoreSimulator/Devices",
+            logicalSize: 250_000_000,
+            physicalSize: 250_000_000,
+            reclaimableSize: 250_000_000,
+            lastModified: nil,
+            riskLevel: .safe,
+            explanation: "",
+            deletionConsequence: "",
+            regenerationImpact: "",
+            isRunningDependency: false,
+            actionType: .simctlDeleteUnavailable
+        )
+
+        do {
+            _ = try await executor.execute(unavailableItem)
+            XCTFail("Expected runningProcessActive when running simctl delete unavailable while Simulator is running")
+        } catch let error as CleanerError {
+            XCTAssertEqual(error, .runningProcessActive(appName: "Simulator", categoryName: "iOS Simulators"))
+        }
+
+        XCTAssertTrue(recorder.calls.isEmpty, "Neither runtime deletion nor unavailable deletion may execute while Simulator is active")
+    }
 }
 
 private final class LockCounter: @unchecked Sendable {
@@ -863,5 +1204,22 @@ private final class LockCounter: @unchecked Sendable {
         let current = value
         value += 1
         return current
+    }
+}
+
+private final class CommandRecorder: @unchecked Sendable {
+    private var recorded: [[String]] = []
+    private let lock = NSLock()
+
+    func record(executable: String, arguments: [String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        recorded.append([executable] + arguments)
+    }
+
+    var calls: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
     }
 }

@@ -41,6 +41,41 @@ public struct SimulatorCleaner: CleanerProvider {
         let isAvailable: Bool?
     }
 
+    public struct LiveDeviceState: Equatable, Sendable {
+        public let udid: String
+        public let name: String
+        public let state: String
+        public let isAvailable: Bool
+
+        public init(udid: String, name: String, state: String, isAvailable: Bool) {
+            self.udid = udid
+            self.name = name
+            self.state = state
+            self.isAvailable = isAvailable
+        }
+
+        /// True only when the simulator's live state is strictly "Shutdown" (not Booted, Booting, Shutting Down, etc.).
+        public var isShutdown: Bool {
+            state.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare("Shutdown") == .orderedSame
+        }
+    }
+
+    public static func lookupDeviceState(udid: String, in data: Data) throws -> LiveDeviceState? {
+        let decoded = try JSONDecoder().decode(SimctlDevicesResponse.self, from: data)
+        for (_, devices) in decoded.devices {
+            if let match = devices.first(where: { $0.udid.caseInsensitiveCompare(udid) == .orderedSame }) {
+                return LiveDeviceState(
+                    udid: match.udid,
+                    name: match.name,
+                    state: match.state,
+                    isAvailable: match.isAvailable ?? true
+                )
+            }
+        }
+        return nil
+    }
+
     public func fetchRuntimes() async -> [SimulatorRuntimeInfo] {
         let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "list", "runtimes", "-j"])
         guard res.isSuccess, let data = res.stdout.data(using: .utf8),

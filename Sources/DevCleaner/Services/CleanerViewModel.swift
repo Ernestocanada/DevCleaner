@@ -204,12 +204,16 @@ public final class CleanerViewModel: ObservableObject {
         for item in targetItems {
             let latestSnapshot = await ProcessMonitor.shared.captureSnapshot()
             let activeProcs = latestSnapshot.matchingProcesses(for: item.category)
-            let isDockerPrune: Bool = {
-                if case .dockerPrune = item.actionType { return true }
-                return false
+            let bypassesCategoryBlocker: Bool = {
+                switch item.actionType {
+                case .dockerPrune, .simctlDeleteDevice:
+                    return true
+                default:
+                    return false
+                }
             }()
 
-            if (!activeProcs.isEmpty && !isDockerPrune) || item.isRunningDependency {
+            if !bypassesCategoryBlocker && (!activeProcs.isEmpty || item.isRunningDependency) {
                 let procLabel = !activeProcs.isEmpty
                     ? activeProcs.joined(separator: ", ")
                     : (item.runningProcessNames.isEmpty ? item.category.rawValue : item.runningProcessNames.joined(separator: ", "))
@@ -323,6 +327,29 @@ public final class CleanerViewModel: ObservableObject {
     }
 
     public func deleteSimulatorRuntime(_ runtime: SimulatorRuntimeInfo) async {
+        let latestSnapshot = await ProcessMonitor.shared.captureSnapshot()
+        let activeProcs = latestSnapshot.matchingProcesses(for: .iosSimulators)
+        if !activeProcs.isEmpty {
+            let procLabel = activeProcs.joined(separator: ", ")
+            let msg = "Cleanup blocked: Close \(procLabel) before cleaning \(CleanerCategory.iosSimulators.rawValue) runtime data."
+            self.statusBannerMessage = msg
+            let entry = CleanupHistoryEntry(
+                category: CleanerCategory.iosSimulators.rawValue,
+                itemName: "Runtime \(runtime.name)",
+                path: "xcrun simctl runtime delete \(runtime.id)",
+                processedBytes: 0,
+                movedToTrashBytes: 0,
+                actuallyFreedBytes: 0,
+                actionDescription: CleanupResultAction.simctlDelete.rawValue,
+                status: .blocked,
+                success: false,
+                message: msg
+            )
+            CleanupHistoryStore.shared.appendEntry(entry)
+            self.historyEntries = CleanupHistoryStore.shared.loadEntries()
+            return
+        }
+
         let freeBefore = DiskScanner.shared.freeDiskSpaceBytes()
         let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "runtime", "delete", runtime.id])
         let freeAfter = DiskScanner.shared.freeDiskSpaceBytes()

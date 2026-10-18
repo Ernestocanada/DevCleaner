@@ -9,6 +9,7 @@ public protocol CleanerProvider: Sendable {
 public enum CleanerError: LocalizedError, Equatable {
     case neverDeleteItem(String)
     case runningProcessActive(appName: String, categoryName: String)
+    case simulatorDeviceActive(deviceName: String, state: String)
     case readOnlyItem(String)
     case commandFailed(String)
 
@@ -18,6 +19,8 @@ public enum CleanerError: LocalizedError, Equatable {
             return "Cleanup blocked: '\(name)' is classified as NEVER DELETE."
         case .runningProcessActive(let appName, let categoryName):
             return "Cleanup blocked: Close \(appName) before cleaning \(categoryName) runtime data."
+        case .simulatorDeviceActive(let deviceName, _):
+            return "Cleanup blocked: \(deviceName) is currently active.\nShut down this simulator before deleting it."
         case .readOnlyItem(let reason):
             return "This item cannot be deleted automatically: \(reason)"
         case .commandFailed(let msg):
@@ -31,6 +34,7 @@ public struct CleanupExecutor: Sendable {
     public let freeSpaceProvider: @Sendable () -> Int64
     public let processChecker: @Sendable (CleanerCategory) async -> [String]
     public let trashHandler: @Sendable (URL) throws -> Void
+    public let shellRunner: @Sendable (String, [String]) async -> ShellResult
 
     public init(
         validator: SafetyValidator = SafetyValidator(),
@@ -41,12 +45,16 @@ public struct CleanupExecutor: Sendable {
         },
         trashHandler: @escaping @Sendable (URL) throws -> Void = { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        },
+        shellRunner: @escaping @Sendable (String, [String]) async -> ShellResult = { executable, arguments in
+            await ShellRunner.shared.run(executable, arguments: arguments)
         }
     ) {
         self.validator = validator
         self.freeSpaceProvider = freeSpaceProvider
         self.processChecker = processChecker
         self.trashHandler = trashHandler
+        self.shellRunner = shellRunner
     }
 
     public func execute(_ item: CleanableItem, ageFilter: AgeFilter = .all) async throws -> CleanupResult {
@@ -60,19 +68,31 @@ public struct CleanupExecutor: Sendable {
             throw CleanerError.readOnlyItem(reason)
         }
 
-        // 3. Check item-level running dependency
-        if item.isRunningDependency {
+        let isPerDeviceSimulatorDelete: Bool = {
+            if case .simctlDeleteDevice = item.actionType { return true }
+            return false
+        }()
+
+        // 3. Check item-level running dependency (per-device simulator delete re-queries live simctl state below)
+        if !isPerDeviceSimulatorDelete && item.isRunningDependency {
             let appName = item.runningProcessNames.isEmpty ? item.category.rawValue : item.runningProcessNames.joined(separator: ", ")
             throw CleanerError.runningProcessActive(appName: appName, categoryName: item.category.rawValue)
         }
 
-        // 4. Re-evaluate live running processes immediately before destructive execution
-        let isDockerCLIPrune: Bool = {
-            if case .dockerPrune = item.actionType { return true }
-            return false
+        // 4. Re-evaluate live running processes immediately before destructive execution:
+        //    - cache/runtime filesystem cleanup, simctlDeleteRuntime, and simctlDeleteUnavailable require category processes closed
+        //    - simctlDeleteDevice validates only the selected UDID's current live state via simctl
+        //    - dockerPrune uses Docker CLI against the running daemon
+        let bypassesCategoryProcessBlocker: Bool = {
+            switch item.actionType {
+            case .dockerPrune, .simctlDeleteDevice:
+                return true
+            default:
+                return false
+            }
         }()
 
-        if !isDockerCLIPrune {
+        if !bypassesCategoryProcessBlocker {
             let liveProcesses = await processChecker(item.category)
             if !liveProcesses.isEmpty {
                 let appName = liveProcesses.joined(separator: ", ")
@@ -218,10 +238,38 @@ public struct CleanupExecutor: Sendable {
             guard UUID(uuidString: udid) != nil else {
                 throw CleanerError.commandFailed("Invalid Simulator UDID: \(udid)")
             }
-            if let simMeta = item.simulatorMetadata, simMeta.isBooted {
-                throw CleanerError.runningProcessActive(appName: "Simulator (\(simMeta.state))", categoryName: item.category.rawValue)
+
+            // Re-query simctl immediately before deletion — never infer state from earlier UI scan
+            let listRes = await shellRunner("/usr/bin/xcrun", ["simctl", "list", "devices", "-j"])
+            guard listRes.isSuccess, let listData = listRes.stdout.data(using: .utf8) else {
+                let detail = listRes.stderr.isEmpty ? listRes.stdout : listRes.stderr
+                throw CleanerError.commandFailed("Unable to verify simulator state via simctl: \(detail)")
             }
-            let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "delete", udid])
+
+            let liveDevice: SimulatorCleaner.LiveDeviceState?
+            do {
+                liveDevice = try SimulatorCleaner.lookupDeviceState(udid: udid, in: listData)
+            } catch {
+                throw CleanerError.commandFailed("Unable to parse simulator state from simctl: \(error.localizedDescription)")
+            }
+
+            guard let targetDevice = liveDevice else {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .simctlDelete,
+                    status: .nothingEligible,
+                    message: "Simulator \(udid) no longer exists (nothing eligible for deletion)."
+                )
+            }
+
+            guard targetDevice.isShutdown else {
+                let displayName = targetDevice.name.isEmpty ? item.name : targetDevice.name
+                throw CleanerError.simulatorDeviceActive(deviceName: displayName, state: targetDevice.state)
+            }
+
+            let res = await shellRunner("/usr/bin/xcrun", ["simctl", "delete", udid])
             if !res.isSuccess {
                 throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
             }
@@ -233,11 +281,11 @@ public struct CleanupExecutor: Sendable {
                 actuallyFreedBytes: freedDelta,
                 action: .simctlDelete,
                 status: .cleaned,
-                message: "Deleted simulator \(udid) via simctl."
+                message: "Deleted simulator \(targetDevice.name) (\(udid)) via simctl."
             )
 
         case .simctlDeleteUnavailable:
-            let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "delete", "unavailable"])
+            let res = await shellRunner("/usr/bin/xcrun", ["simctl", "delete", "unavailable"])
             if !res.isSuccess {
                 throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
             }
@@ -256,7 +304,7 @@ public struct CleanupExecutor: Sendable {
             )
 
         case .simctlDeleteRuntime(let identifier):
-            let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "runtime", "delete", identifier])
+            let res = await shellRunner("/usr/bin/xcrun", ["simctl", "runtime", "delete", identifier])
             if !res.isSuccess {
                 throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
             }
@@ -276,7 +324,7 @@ public struct CleanupExecutor: Sendable {
             guard let dockerBin = dockerPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
                 throw CleanerError.commandFailed("Docker CLI not found.")
             }
-            let res = await ShellRunner.shared.run(dockerBin, arguments: subcommand)
+            let res = await shellRunner(dockerBin, subcommand)
             if !res.isSuccess {
                 throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
             }
