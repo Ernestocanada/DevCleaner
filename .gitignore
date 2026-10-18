@@ -4,3 +4,19 @@ DerivedData/
 *.xcuserstate
 .DS_Store
 DevCleaner.app/
+
+# Local secrets / credentials
+.env
+.env.*
+GoogleService-Info.plist
+google-services.json
+credentials*.json
+client_secret*.json
+service-account*.json
+service_account*.json
+*.pem
+*.p12
+*.key
+
+# Local release artifacts
+*.zip
