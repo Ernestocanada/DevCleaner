@@ -117,7 +117,7 @@ public struct DockerCleaner: CleanerProvider {
                     path: containerRoot,
                     logicalSize: 0,
                     physicalSize: 0,
-                    reclaimableSize: daemonRunning ? 1 : 0,
+                    reclaimableSize: 0,
                     lastModified: usage.lastModified,
                     riskLevel: spec.risk,
                     explanation: daemonRunning ? spec.desc : "\(spec.desc) (Requires Docker Desktop running)",

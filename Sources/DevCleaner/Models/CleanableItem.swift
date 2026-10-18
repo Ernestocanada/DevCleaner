@@ -209,6 +209,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         guard riskLevel != .neverDelete else { return false }
         guard !isRunningDependency else { return false }
         if case .readOnlyInfo = actionType { return false }
+        if case .dockerPrune = actionType { return true }
         return reclaimableSize > 0 || actionType == .simctlDeleteUnavailable
     }
 
