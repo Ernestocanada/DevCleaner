@@ -121,7 +121,21 @@ public struct SafetyValidator: Sendable {
         "google-services.json",
         "firebase-adminsdk.json",
         "application_default_credentials.json",
+        "service-account.json",
+        "service_account.json",
+        "credentials.json",
+        "client_secret.json",
         "Docker.raw"
+    ]
+
+    private let sensitiveJSONTokens: [String] = [
+        "service-account",
+        "service_account",
+        "adminsdk",
+        "credential",
+        "client_secret",
+        "private_key",
+        "private-key"
     ]
 
     public func isForbiddenComponentName(_ comp: String) -> Bool {
@@ -129,10 +143,18 @@ public struct SafetyValidator: Sendable {
             return true
         }
         let lower = comp.lowercased()
-        if comp.hasPrefix(".env.") ||
-           (lower.contains("firebase") && lower.contains("credential")) ||
-           (lower.contains("firebase") && lower.hasSuffix(".json")) {
+        if lower == "googleservice-info.plist" || lower == "google-services.json" {
             return true
+        }
+        if comp.hasPrefix(".env.") {
+            return true
+        }
+        if lower.hasSuffix(".json") {
+            for token in sensitiveJSONTokens {
+                if lower.contains(token) {
+                    return true
+                }
+            }
         }
         return false
     }

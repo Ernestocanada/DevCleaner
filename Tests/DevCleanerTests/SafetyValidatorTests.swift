@@ -170,4 +170,46 @@ final class SafetyValidatorTests: XCTestCase {
             XCTAssertTrue(normalized.hasPrefix("/Users/ernesto/"))
         }
     }
+
+    func testFirebaseDependencyMetadataInCachesIsPermitted() throws {
+        let validPackageMetadataPaths = [
+            "~/.npm/_npx/8843fba6d2859245/node_modules/firebase-tools/schema/firebase-config.json",
+            "~/.npm/_npx/8843fba6d2859245/firebase-config.json",
+            "~/.gradle/caches/9.3.1/transforms/07298d8900aeb663b234fa79a0c1cdfa/transformed/com.google.firebase.encoders.json",
+            "~/.gradle/caches/com.google.firebase.encoders.json"
+        ]
+
+        for path in validPackageMetadataPaths {
+            XCTAssertTrue(
+                validator.isSafeToDelete(path, checkSymlinksOnDisk: false),
+                "Package metadata inside allow-listed cache must be allowed: \(path)"
+            )
+            let normalized = try validator.validateForDeletion(path, checkSymlinksOnDisk: false)
+            XCTAssertTrue(normalized.hasPrefix("/Users/ernesto/"))
+        }
+    }
+
+    func testKnownSensitiveCredentialFilesAreStrictlyBlocked() {
+        let sensitiveCredentialPaths = [
+            "~/.npm/_npx/8843fba6d2859245/GoogleService-Info.plist",
+            "~/.gradle/caches/google-services.json",
+            "~/.npm/_npx/firebase-adminsdk-abc123.json",
+            "~/.npm/_npx/application_default_credentials.json",
+            "~/.gradle/caches/service-account.json",
+            "~/.gradle/caches/service_account.json",
+            "~/.npm/_cacache/credentials.json",
+            "~/.npm/_cacache/credentials_prod.json",
+            "~/.gradle/caches/client_secret_123.json",
+            "~/.gradle/caches/client_secret.json",
+            "~/.npm/_npx/.env"
+        ]
+
+        for path in sensitiveCredentialPaths {
+            XCTAssertFalse(
+                validator.isSafeToDelete(path, checkSymlinksOnDisk: false),
+                "Sensitive credential file must be blocked: \(path)"
+            )
+            XCTAssertThrowsError(try validator.validateForDeletion(path, checkSymlinksOnDisk: false))
+        }
+    }
 }

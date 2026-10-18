@@ -612,6 +612,116 @@ final class CleanupHardeningTests: XCTestCase {
         XCTAssertEqual(codexSessions.riskLevel, .neverDelete)
         XCTAssertFalse(codexSessions.canBeSelected)
     }
+
+    // MARK: - 6. Regression Tests: Firebase Package Metadata vs Real Credentials in Subtree Scan
+
+    func testExecutorCleansNpxAndGradleFirebasePackageMetadata() async throws {
+        let npxSchemaFile = try createFile(
+            relativeToHome: ".npm/_npx/8843fba6d2859245/node_modules/firebase-tools/schema/firebase-config.json",
+            sizeBytes: 4096
+        )
+        let gradleEncoderFile = try createFile(
+            relativeToHome: ".gradle/caches/9.3.1/transforms/07298d8900aeb663b234fa79a0c1cdfa/transformed/com.google.firebase.encoders.json",
+            sizeBytes: 4096
+        )
+
+        let npxDir = tempHome.appendingPathComponent(".npm/_npx").path
+        let gradleDir = tempHome.appendingPathComponent(".gradle/caches").path
+
+        let npxItem = CleanableItem(
+            id: "npm-npx",
+            name: "npm _npx Temporary Packages",
+            category: .nodeNpm,
+            path: npxDir,
+            logicalSize: 4096,
+            physicalSize: 4096,
+            reclaimableSize: 4096,
+            lastModified: Date(),
+            riskLevel: .safe,
+            explanation: "",
+            deletionConsequence: "",
+            regenerationImpact: "",
+            isRunningDependency: false,
+            actionType: .moveToTrashContents(directoryPath: npxDir, minAgeDays: nil)
+        )
+
+        let gradleItem = CleanableItem(
+            id: "gradle-caches",
+            name: "Gradle Build & Artifact Caches",
+            category: .gradle,
+            path: gradleDir,
+            logicalSize: 4096,
+            physicalSize: 4096,
+            reclaimableSize: 4096,
+            lastModified: Date(),
+            riskLevel: .safe,
+            explanation: "",
+            deletionConsequence: "",
+            regenerationImpact: "",
+            isRunningDependency: false,
+            actionType: .moveToTrashContents(directoryPath: gradleDir, minAgeDays: nil)
+        )
+
+        let executor = makeIsolatedExecutor()
+        let npxResult = try await executor.execute(npxItem)
+        let gradleResult = try await executor.execute(gradleItem)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: npxSchemaFile.path), "firebase-config.json schema in _npx must be cleaned without false positive")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: gradleEncoderFile.path), "com.google.firebase.encoders.json in Gradle cache must be cleaned without false positive")
+        XCTAssertGreaterThan(npxResult.movedToTrashBytes, 0)
+        XCTAssertGreaterThan(gradleResult.movedToTrashBytes, 0)
+    }
+
+    func testExecutorBlocksSubtreeWithExplicitCredentialFiles() async throws {
+        let blockedFileNames = [
+            "GoogleService-Info.plist",
+            "google-services.json",
+            "firebase-adminsdk-abc123.json",
+            "application_default_credentials.json",
+            "service-account.json",
+            "credentials.json",
+            "client_secret_123.json",
+            ".env"
+        ]
+
+        let executor = makeIsolatedExecutor()
+
+        for (index, fileName) in blockedFileNames.enumerated() {
+            let subDirRel = ".npm/_npx/test-cred-\(index)"
+            let credFileURL = try createFile(relativeToHome: "\(subDirRel)/nested/\(fileName)", sizeBytes: 512)
+            let npxDir = tempHome.appendingPathComponent(".npm/_npx").path
+
+            let item = CleanableItem(
+                id: "npm-npx-\(index)",
+                name: "npm _npx",
+                category: .nodeNpm,
+                path: npxDir,
+                logicalSize: 512,
+                physicalSize: 512,
+                reclaimableSize: 512,
+                lastModified: Date(),
+                riskLevel: .safe,
+                explanation: "",
+                deletionConsequence: "",
+                regenerationImpact: "",
+                isRunningDependency: false,
+                actionType: .moveToTrashContents(directoryPath: npxDir, minAgeDays: nil)
+            )
+
+            do {
+                _ = try await executor.execute(item)
+                XCTFail("Expected SafetyError.forbiddenFileOrComponent for \(fileName)")
+            } catch let error as SafetyError {
+                guard case .forbiddenFileOrComponent = error else {
+                    XCTFail("Expected forbiddenFileOrComponent for \(fileName), got \(error)")
+                    return
+                }
+            }
+
+            XCTAssertTrue(FileManager.default.fileExists(atPath: credFileURL.path), "Credential file \(fileName) must remain untouched")
+            try FileManager.default.removeItem(at: tempHome.appendingPathComponent(subDirRel))
+        }
+    }
 }
 
 private final class LockCounter: @unchecked Sendable {
