@@ -8,6 +8,7 @@ public final class CleanerViewModel: ObservableObject {
     @Published public var isScanning: Bool = false
     @Published public var isCleaning: Bool = false
     @Published public var lastScanDate: Date? = nil
+    @Published public var storageMetrics: StorageMetrics = .zero
     @Published public var freeSpaceBytes: Int64 = 0
     @Published public var ageFilter: AgeFilter = .all
     @Published public var developmentModeActive: Bool = false
@@ -40,8 +41,26 @@ public final class CleanerViewModel: ObservableObject {
     private let executor = CleanupExecutor()
 
     public init() {
-        self.freeSpaceBytes = DiskScanner.shared.freeDiskSpaceBytes()
+        let metrics = DiskScanner.shared.currentStorageMetrics()
+        self.storageMetrics = metrics
+        self.freeSpaceBytes = metrics.macOSAvailableBytes
         self.historyEntries = CleanupHistoryStore.shared.loadEntries()
+    }
+
+    public var macOSAvailableBytes: Int64 {
+        storageMetrics.macOSAvailableBytes
+    }
+
+    public var physicalFreeBytes: Int64 {
+        storageMetrics.physicalFreeBytes
+    }
+
+    public var potentialCleanupBytes: Int64 {
+        totalReclaimableBytes
+    }
+
+    public var selectedCleanupBytes: Int64 {
+        selectedReclaimableBytes
     }
 
     public func performScan() async {
@@ -50,7 +69,7 @@ public final class CleanerViewModel: ObservableObject {
 
         let currentFilter = ageFilter
         let snapshot = await ProcessMonitor.shared.captureSnapshot()
-        let freeBytes = DiskScanner.shared.freeDiskSpaceBytes()
+        let metrics = DiskScanner.shared.currentStorageMetrics()
 
         var allScanned: [CleanableItem] = []
         await withTaskGroup(of: [CleanableItem].self) { group in
@@ -78,7 +97,8 @@ public final class CleanerViewModel: ObservableObject {
 
         self.items = allScanned
         self.simulatorRuntimes = runtimes
-        self.freeSpaceBytes = freeBytes
+        self.storageMetrics = metrics
+        self.freeSpaceBytes = metrics.macOSAvailableBytes
         self.lastScanDate = Date()
 
         let validSelectableIDs = Set(allScanned.filter { $0.canBeSelected }.map { $0.id })

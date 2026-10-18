@@ -7,6 +7,17 @@ public struct DevCleanerApp: App {
 
     public init() {
         let args = CommandLine.arguments
+        if args.contains("--generate-icons") {
+            let rootURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            do {
+                try AppIconBranding.exportIconAssets(projectRoot: rootURL)
+                print("Generated DevCleaner icon assets in \(rootURL.path)/Sources/DevCleaner/Resources")
+                exit(0)
+            } catch {
+                fputs("Failed to generate icon assets: \(error)\n", stderr)
+                exit(1)
+            }
+        }
         if args.contains("--cli-report") {
             Task {
                 await Self.runHeadlessReadOnlyReport()
@@ -22,6 +33,7 @@ public struct DevCleanerApp: App {
                 .frame(minWidth: 980, minHeight: 700)
                 .onAppear {
                     NSApplication.shared.setActivationPolicy(.regular)
+                    NSApplication.shared.applicationIconImage = AppIconBranding.makeAppIconImage(pixelSize: 512)
                     NSApplication.shared.activate(ignoringOtherApps: true)
                 }
         }
@@ -36,7 +48,8 @@ public struct DevCleanerApp: App {
         let reviewAllAges = await MainActor.run { vm.potentialBytes(for: .review) }
         let cautionAllAges = await MainActor.run { vm.potentialBytes(for: .caution) }
         let totalAllAges = await MainActor.run { vm.totalReclaimableBytes }
-        let freeSpace = await MainActor.run { vm.freeSpaceBytes }
+        let macOSAvailable = await MainActor.run { vm.macOSAvailableBytes }
+        let physicalFree = await MainActor.run { vm.physicalFreeBytes }
         let allItems = await MainActor.run { vm.items }
 
         // Also compute 7-day Development Cleanup read-only estimate
@@ -46,8 +59,9 @@ public struct DevCleanerApp: App {
         let recommendedSevenDays = await MainActor.run { vm.selectedReclaimableBytes }
 
         print("=================================================================")
-        print("DevCleaner Read-Only Scan Report (v1.2 Unified CleanupPlanner)")
-        print("Free Disk Space:                   \(Formatters.bytes(freeSpace))")
+        print("DevCleaner Read-Only Scan Report (v1.4 Storage & Branding)")
+        print("macOS Available:                   \(Formatters.bytes(macOSAvailable))")
+        print("Physical Free:                     \(Formatters.bytes(physicalFree))")
         print("Potential Cleanup (All Ages):      \(Formatters.bytes(totalAllAges))")
         print("  - SAFE potential:                \(Formatters.bytes(safeAllAges))")
         print("  - REVIEW potential:              \(Formatters.bytes(reviewAllAges))")

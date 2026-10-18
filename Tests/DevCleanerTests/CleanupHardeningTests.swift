@@ -1192,6 +1192,21 @@ final class CleanupHardeningTests: XCTestCase {
 
         XCTAssertTrue(recorder.calls.isEmpty, "Neither runtime deletion nor unavailable deletion may execute while Simulator is active")
     }
+
+    func testStorageMetricsAndAppIconBranding() throws {
+        let metrics = DiskScanner.shared.currentStorageMetrics()
+        XCTAssertGreaterThan(metrics.macOSAvailableBytes, 0, "macOSAvailableBytes must be > 0")
+        XCTAssertGreaterThan(metrics.physicalFreeBytes, 0, "physicalFreeBytes must be > 0")
+        XCTAssertGreaterThanOrEqual(
+            metrics.macOSAvailableBytes,
+            metrics.physicalFreeBytes,
+            "macOS available capacity (which includes purgeable space) should be >= physically free SSD bytes"
+        )
+
+        let iconData = AppIconBranding.pngData(pixelSize: 256)
+        XCTAssertNotNil(iconData, "AppIconBranding must generate valid PNG data")
+        XCTAssertGreaterThan(iconData?.count ?? 0, 1024, "Generated icon PNG must be non-empty")
+    }
 }
 
 private final class LockCounter: @unchecked Sendable {

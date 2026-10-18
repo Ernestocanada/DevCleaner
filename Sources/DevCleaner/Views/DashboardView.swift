@@ -176,51 +176,98 @@ public struct DashboardView: View {
         .background(Color.green.opacity(0.08))
     }
 
+    private static let storageMetricsHelpText = """
+macOS Available includes purgeable storage that macOS can reclaim automatically.
+Physical Free is the SSD space that is actually empty right now.
+"""
+
+    @State private var showingStorageHelpPopover: Bool = false
+
     private var headerSection: some View {
-        VStack(spacing: 14) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "externaldrive.fill.badge.checkmark")
-                            .font(.title2)
-                            .foregroundColor(.accentColor)
-                        Text("DevCleaner")
-                            .font(.system(size: 22, weight: .bold, design: .rounded))
-                        Text("Developer Storage Cleaner")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .padding(.top, 4)
-                    }
-                    HStack(spacing: 16) {
-                        Label("Never touches ~/Developer or source code", systemImage: "lock.shield.fill")
-                            .font(.caption)
-                            .foregroundColor(.green)
-                        if let scanDate = viewModel.lastScanDate {
-                            Text("Last scan: \(scanDate.formatted(date: .omitted, time: .standard))")
-                                .font(.caption)
+        VStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 16) {
+                HStack(alignment: .center, spacing: 12) {
+                    DevCleanerBrandIconView(size: 42)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text("DevCleaner")
+                                .font(.system(size: 22, weight: .bold, design: .rounded))
+                            Text("Developer Storage Cleaner")
+                                .font(.subheadline)
                                 .foregroundColor(.secondary)
+                        }
+                        HStack(spacing: 14) {
+                            Label("Never touches ~/Developer or source code", systemImage: "lock.shield.fill")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                            if let scanDate = viewModel.lastScanDate {
+                                Text("Last scan: \(scanDate.formatted(date: .omitted, time: .standard))")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
                 }
 
                 Spacer()
 
-                HStack(spacing: 24) {
-                    statMetric(
-                        title: "Free Disk Space",
-                        value: Formatters.bytes(viewModel.freeSpaceBytes),
-                        color: .primary
-                    )
-                    statMetric(
-                        title: "Potential Cleanup (Est.)",
-                        value: Formatters.bytes(viewModel.totalReclaimableBytes),
-                        color: .accentColor
-                    )
-                    statMetric(
-                        title: "Selected",
-                        value: Formatters.bytes(viewModel.selectedReclaimableBytes),
-                        color: .green
-                    )
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(alignment: .top, spacing: 20) {
+                        statMetric(
+                            title: "macOS Available",
+                            value: Formatters.bytes(viewModel.macOSAvailableBytes),
+                            color: .primary,
+                            helpText: "Storage macOS says is available for important usage (can include purgeable space)."
+                        )
+                        statMetric(
+                            title: "Physical Free",
+                            value: Formatters.bytes(viewModel.physicalFreeBytes),
+                            color: .secondary,
+                            helpText: "Storage physically free on the SSD right now (excluding purgeable space)."
+                        )
+                        statMetric(
+                            title: "Potential Cleanup",
+                            value: Formatters.bytes(viewModel.potentialCleanupBytes),
+                            color: .accentColor,
+                            helpText: "Estimated developer cache and build storage eligible for cleanup."
+                        )
+                        statMetric(
+                            title: "Selected",
+                            value: Formatters.bytes(viewModel.selectedCleanupBytes),
+                            color: .green,
+                            helpText: "Currently selected items ready for preview and cleanup."
+                        )
+
+                        Button {
+                            showingStorageHelpPopover.toggle()
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 2)
+                        .help(Self.storageMetricsHelpText)
+                        .popover(isPresented: $showingStorageHelpPopover, arrowEdge: .bottom) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Understanding macOS Storage Metrics")
+                                    .font(.caption.bold())
+                                Text("macOS Available includes purgeable storage that macOS can reclaim automatically.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("Physical Free is the SSD space that is actually empty right now.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(12)
+                            .frame(width: 310)
+                        }
+                    }
+
+                    Text("macOS Available includes purgeable storage that macOS can reclaim automatically. Physical Free is the SSD space that is actually empty right now.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .help(Self.storageMetricsHelpText)
                 }
             }
 
@@ -283,15 +330,16 @@ public struct DashboardView: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    private func statMetric(title: String, value: String, color: Color) -> some View {
+    private func statMetric(title: String, value: String, color: Color, helpText: String) -> some View {
         VStack(alignment: .trailing, spacing: 2) {
             Text(title)
                 .font(.caption)
                 .foregroundColor(.secondary)
             Text(value)
-                .font(.system(size: 18, weight: .bold, design: .rounded).monospacedDigit())
+                .font(.system(size: 17, weight: .bold, design: .rounded).monospacedDigit())
                 .foregroundColor(color)
         }
+        .help(helpText)
     }
 
     private var footerBar: some View {

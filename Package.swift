@@ -12,7 +12,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DevCleaner",
-            path: "Sources/DevCleaner"
+            path: "Sources/DevCleaner",
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "DevCleanerTests",

@@ -17,13 +17,27 @@ public struct DiskUsageInfo: Sendable, Equatable {
     public static let zero = DiskUsageInfo(logicalSize: 0, physicalSize: 0, lastModified: nil, fileCount: 0)
 }
 
+public struct StorageMetrics: Sendable, Equatable {
+    /// Storage macOS says is available for important usage (can include purgeable space).
+    public let macOSAvailableBytes: Int64
+    /// Storage physically free on disk right now (excluding purgeable space).
+    public let physicalFreeBytes: Int64
+
+    public init(macOSAvailableBytes: Int64, physicalFreeBytes: Int64) {
+        self.macOSAvailableBytes = macOSAvailableBytes
+        self.physicalFreeBytes = physicalFreeBytes
+    }
+
+    public static let zero = StorageMetrics(macOSAvailableBytes: 0, physicalFreeBytes: 0)
+}
+
 public final class DiskScanner: Sendable {
     public static let shared = DiskScanner()
 
     public init() {}
 
-    /// Returns available free space on the user's home volume in bytes.
-    public func freeDiskSpaceBytes() -> Int64 {
+    /// Returns storage macOS reports as available for important usage (can include purgeable space).
+    public func macOSAvailableSpaceBytes() -> Int64 {
         let homeURL = FileManager.default.homeDirectoryForCurrentUser
         do {
             let values = try homeURL.resourceValues(forKeys: [
@@ -40,6 +54,48 @@ public final class DiskScanner: Sendable {
             // Fallback below
         }
         return 0
+    }
+
+    /// Returns storage physically free on the SSD right now using filesystem/statfs attributes.
+    public func physicalFreeSpaceBytes() -> Int64 {
+        let homeURL = FileManager.default.homeDirectoryForCurrentUser
+        let homePath = homeURL.path
+
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: homePath),
+           let freeNumber = attrs[.systemFreeSize] as? NSNumber {
+            let freeBytes = freeNumber.int64Value
+            if freeBytes > 0 {
+                return freeBytes
+            }
+        }
+
+        var fs = statfs()
+        if statfs(homePath, &fs) == 0 {
+            let physical = Int64(fs.f_bavail) * Int64(fs.f_bsize)
+            if physical > 0 {
+                return physical
+            }
+        }
+
+        if let values = try? homeURL.resourceValues(forKeys: [.volumeAvailableCapacityKey]),
+           let standard = values.volumeAvailableCapacity {
+            return Int64(standard)
+        }
+
+        return 0
+    }
+
+    /// Returns distinct macOS Available and Physical Free storage metrics.
+    public func currentStorageMetrics() -> StorageMetrics {
+        StorageMetrics(
+            macOSAvailableBytes: macOSAvailableSpaceBytes(),
+            physicalFreeBytes: physicalFreeSpaceBytes()
+        )
+    }
+
+    /// Returns available free space on the user's home volume in bytes.
+    public func freeDiskSpaceBytes() -> Int64 {
+        macOSAvailableSpaceBytes()
     }
 
     /// Returns filesystem device ID (`st_dev`) for a path without following symlinks.
