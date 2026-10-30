@@ -22,13 +22,21 @@ public struct StorageMetrics: Sendable, Equatable {
     public let macOSAvailableBytes: Int64
     /// Storage physically free on disk right now (excluding purgeable space).
     public let physicalFreeBytes: Int64
+    /// Physical bytes currently sitting in the user's macOS Trash (~/.Trash) awaiting permanent removal.
+    public let trashBytes: Int64
 
-    public init(macOSAvailableBytes: Int64, physicalFreeBytes: Int64) {
-        self.macOSAvailableBytes = macOSAvailableBytes
-        self.physicalFreeBytes = physicalFreeBytes
+    /// Estimated purgeable space managed by macOS/APFS (difference between macOS Available and Physical Free).
+    public var purgeableBytes: Int64 {
+        max(0, macOSAvailableBytes - physicalFreeBytes)
     }
 
-    public static let zero = StorageMetrics(macOSAvailableBytes: 0, physicalFreeBytes: 0)
+    public init(macOSAvailableBytes: Int64, physicalFreeBytes: Int64, trashBytes: Int64 = 0) {
+        self.macOSAvailableBytes = macOSAvailableBytes
+        self.physicalFreeBytes = physicalFreeBytes
+        self.trashBytes = trashBytes
+    }
+
+    public static let zero = StorageMetrics(macOSAvailableBytes: 0, physicalFreeBytes: 0, trashBytes: 0)
 }
 
 public final class DiskScanner: Sendable {
@@ -85,11 +93,19 @@ public final class DiskScanner: Sendable {
         return 0
     }
 
-    /// Returns distinct macOS Available and Physical Free storage metrics.
+    /// Returns physical bytes currently sitting in the user's macOS Trash (~/.Trash).
+    public func trashSizeBytes(homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path) -> Int64 {
+        let trashPath = "\(homeDirectory)/.Trash"
+        guard FileManager.default.fileExists(atPath: trashPath) else { return 0 }
+        return measurePath(trashPath).physicalSize
+    }
+
+    /// Returns distinct macOS Available, Physical Free, and Trash storage metrics.
     public func currentStorageMetrics() -> StorageMetrics {
         StorageMetrics(
             macOSAvailableBytes: macOSAvailableSpaceBytes(),
-            physicalFreeBytes: physicalFreeSpaceBytes()
+            physicalFreeBytes: physicalFreeSpaceBytes(),
+            trashBytes: trashSizeBytes()
         )
     }
 
@@ -110,7 +126,16 @@ public final class DiskScanner: Sendable {
     /// Calculates logical and physical (allocated APFS/sparse) size of a file or directory,
     /// staying on the same filesystem (`du -x` equivalent) and never traversing symlinks or CoreDevice virtual mounts.
     /// If `minAgeDays` is provided, only counts top-level entries or files modified more than `minAgeDays` ago.
-    public func measurePath(_ rawPath: String, minAgeDays: Int? = nil) -> DiskUsageInfo {
+    /// If `excludedSubpaths` is provided, skips any matching directory subtrees to prevent double-counting.
+    public func measurePath(
+        _ rawPath: String,
+        minAgeDays: Int? = nil,
+        excludedSubpaths: Set<String> = [],
+        shouldCancel: (@Sendable () -> Bool)? = nil
+    ) -> DiskUsageInfo {
+        if Task.isCancelled || shouldCancel?() == true {
+            return .zero
+        }
         let expanded = (rawPath as NSString).expandingTildeInPath
         let home = FileManager.default.homeDirectoryForCurrentUser.path
 
@@ -153,7 +178,14 @@ public final class DiskScanner: Sendable {
             return nil
         }()
 
-        let rootURL = URL(fileURLWithPath: expanded, isDirectory: true)
+        var normalizedExcluded = Set<String>()
+        for ex in excludedSubpaths {
+            let exURL = URL(fileURLWithPath: ex)
+            normalizedExcluded.insert(exURL.standardizedFileURL.path)
+            normalizedExcluded.insert(exURL.resolvingSymlinksInPath().path)
+        }
+
+        let rootURL = URL(fileURLWithPath: expanded, isDirectory: true).resolvingSymlinksInPath()
         let resourceKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
             .isDirectoryKey,
@@ -180,9 +212,23 @@ public final class DiskScanner: Sendable {
         var latestModified: Date? = nil
         var count = 0
         var seenInodes = Set<UInt64>()
+        var checkCounter = 0
 
         for case let fileURL as URL in enumerator {
+            checkCounter += 1
+            if checkCounter % 256 == 0 {
+                if Task.isCancelled || shouldCancel?() == true {
+                    return .zero
+                }
+            }
+
             let itemPath = fileURL.path
+
+            if !normalizedExcluded.isEmpty &&
+               (normalizedExcluded.contains(itemPath) || normalizedExcluded.contains(fileURL.standardizedFileURL.path)) {
+                enumerator.skipDescendants()
+                continue
+            }
 
             // Never enter virtual CoreDevice or mounted simulator volumes
             if itemPath.hasPrefix("\(home)/Library/Developer/CoreDevice") ||

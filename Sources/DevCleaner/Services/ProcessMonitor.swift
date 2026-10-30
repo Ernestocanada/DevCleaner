@@ -134,8 +134,41 @@ public struct ActiveProcessSnapshot: Sendable {
             }
         case .generalCaches:
             break
+        case .projectStorage:
+            if checkCommand("xcodebuild") {
+                matched.insert("xcodebuild")
+            }
+            if checkCommand("GradleDaemon") || checkCommand("org.gradle.launcher") {
+                matched.insert("Gradle")
+            }
+            if checkCommand("swift-build") || checkCommand("swift-test") {
+                matched.insert("swift-build")
+            }
         }
 
+        return Array(matched).sorted()
+    }
+
+    public func matchingProcesses(forProjectPath projectPath: String) -> [String] {
+        var matched = Set<String>()
+        for line in activeLines {
+            guard line.contains(projectPath) else { continue }
+            if line.localizedCaseInsensitiveContains("next") {
+                matched.insert("Next.js dev/build")
+            } else if line.localizedCaseInsensitiveContains("expo") || line.localizedCaseInsensitiveContains("metro") {
+                matched.insert("Expo / Metro")
+            } else if line.localizedCaseInsensitiveContains("xcodebuild") {
+                matched.insert("xcodebuild")
+            } else if line.localizedCaseInsensitiveContains("gradle") {
+                matched.insert("Gradle")
+            } else if line.localizedCaseInsensitiveContains("node") {
+                matched.insert("node")
+            } else if line.localizedCaseInsensitiveContains("swift") {
+                matched.insert("swift")
+            } else {
+                matched.insert("Active project process")
+            }
+        }
         return Array(matched).sorted()
     }
 }

@@ -63,6 +63,11 @@ public struct CleanupExecutor: Sendable {
             throw CleanerError.neverDeleteItem(item.name)
         }
 
+        // 1b. Favorite simulators are strictly protected from deletion
+        if item.simulatorMetadata?.isFavorite == true {
+            throw CleanerError.readOnlyItem("Simulator '\(item.name)' is marked as Favorite and protected from deletion.")
+        }
+
         // 2. Check readOnlyInfo first
         if case .readOnlyInfo(let reason) = item.actionType {
             throw CleanerError.readOnlyItem(reason)
@@ -141,6 +146,46 @@ public struct CleanupExecutor: Sendable {
                 action: .moveToTrash,
                 status: .cleaned,
                 message: "Moved to macOS Trash (\(Formatters.bytes(movedBytes))). Empty Trash to recover disk space."
+            )
+
+        case .moveToTrashVerifiedProjectArtifact(let rawPath, let projectRoot, let expectedModifiedAt):
+            let validatedPath = try validator.validateVerifiedProjectArtifactForDeletion(
+                rawPath,
+                projectRoot: projectRoot,
+                expectedModifiedAt: expectedModifiedAt,
+                checkSymlinksOnDisk: true
+            )
+            guard FileManager.default.fileExists(atPath: validatedPath) else {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
+            }
+            let beforeUsage = DiskScanner.shared.measurePath(validatedPath)
+            let url = URL(fileURLWithPath: validatedPath)
+            try trashHandler(url)
+            let movedBytes = beforeUsage.physicalSize > 0 ? beforeUsage.physicalSize : item.reclaimableSize
+            if movedBytes == 0 {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
+            }
+            return CleanupResult(
+                processedBytes: movedBytes,
+                movedToTrashBytes: movedBytes,
+                actuallyFreedBytes: 0,
+                action: .moveToTrash,
+                status: .cleaned,
+                message: "Moved verified project artifact to macOS Trash (\(Formatters.bytes(movedBytes))). Empty Trash to recover disk space."
             )
 
         case .moveToTrashContents(let directoryPath, let fixedAge):

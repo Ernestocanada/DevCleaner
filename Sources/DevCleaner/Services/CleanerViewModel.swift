@@ -1,8 +1,44 @@
 import Foundation
 import AppKit
 
+public enum MainAnalyzerTab: String, CaseIterable, Identifiable, Sendable {
+    case systemAndTools = "System & Tools"
+    case projectStorage = "Project Storage"
+    case worktrees = "Worktrees"
+
+    public var id: String { rawValue }
+
+    public var iconName: String {
+        switch self {
+        case .systemAndTools: return "externaldrive.fill.badge.checkmark"
+        case .projectStorage: return "folder.fill.badge.gearshape"
+        case .worktrees: return "point.3.connected.trianglepath.dotted"
+        }
+    }
+}
+
+public final class AtomicCancellationFlag: @unchecked Sendable {
+    private var cancelled = false
+    private let lock = NSLock()
+
+    public init() {}
+
+    public func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    public var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 @MainActor
 public final class CleanerViewModel: ObservableObject {
+    @Published public var selectedTab: MainAnalyzerTab = .systemAndTools
     @Published public var items: [CleanableItem] = []
     @Published public var selectedIDs: Set<String> = []
     @Published public var isScanning: Bool = false
@@ -17,11 +53,23 @@ public final class CleanerViewModel: ObservableObject {
     @Published public var statusBannerMessage: String? = nil
     @Published public var lastCleanupSummary: CleanupBatchSummary? = nil
 
+    // Project Storage Analyzer & Worktree Analyzer state
+    @Published public var projectsRootPath: String = ProjectStorageAnalyzer.defaultDeveloperRoot
+    @Published public var projectReports: [ProjectStorageReport] = []
+    @Published public var projectSummary: ProjectStorageSummary = .empty
+    @Published public var isScanningProjects: Bool = false
+    @Published public var projectScanProgressText: String = ""
+    @Published public var worktreeRecords: [GitWorktreeRecord] = []
+    @Published public var isScanningWorktrees: Bool = false
+
     // Sheet states
     @Published public var showingPreviewSheet: Bool = false
     @Published public var showingHistorySheet: Bool = false
     @Published public var showingRuntimesSheet: Bool = false
     @Published public var itemForSingleClean: CleanableItem? = nil
+
+    private var projectScanCancellation: AtomicCancellationFlag?
+    private var projectScanTask: Task<Void, Never>?
 
     private let providers: [CleanerProvider] = [
         StandardCacheCleaner(category: .xcode),
@@ -38,6 +86,8 @@ public final class CleanerViewModel: ObservableObject {
         StandardCacheCleaner(category: .generalCaches)
     ]
 
+    private let projectAnalyzer = ProjectStorageAnalyzer()
+    private let worktreeAnalyzer = GitWorktreeAnalyzer()
     private let executor = CleanupExecutor()
 
     public init() {
@@ -55,6 +105,14 @@ public final class CleanerViewModel: ObservableObject {
         storageMetrics.physicalFreeBytes
     }
 
+    public var purgeableBytes: Int64 {
+        storageMetrics.purgeableBytes
+    }
+
+    public var trashBytes: Int64 {
+        storageMetrics.trashBytes
+    }
+
     public var potentialCleanupBytes: Int64 {
         totalReclaimableBytes
     }
@@ -69,7 +127,41 @@ public final class CleanerViewModel: ObservableObject {
 
         let currentFilter = ageFilter
         let snapshot = await ProcessMonitor.shared.captureSnapshot()
-        let metrics = DiskScanner.shared.currentStorageMetrics()
+        let metrics = await Task.detached(priority: .userInitiated) {
+            DiskScanner.shared.currentStorageMetrics()
+        }.value
+
+        let rootToScan = projectsRootPath
+        let cancelFlag = AtomicCancellationFlag()
+        self.projectScanCancellation = cancelFlag
+        self.isScanningProjects = true
+        self.isScanningWorktrees = true
+        self.projectScanProgressText = "Scanning \(rootToScan)..."
+
+        let pAnalyzer = self.projectAnalyzer
+        let wAnalyzer = self.worktreeAnalyzer
+
+        // Start Project Storage & Worktrees scan concurrently in the background
+        let projectsTask = Task.detached(priority: .userInitiated) {
+            await pAnalyzer.analyzeProjects(
+                in: rootToScan,
+                snapshot: snapshot,
+                shouldCancel: { cancelFlag.isCancelled },
+                onProgress: { index, total, projectName in
+                    Task { @MainActor in
+                        self.projectScanProgressText = "Analyzing project \(index)/\(total): \(projectName)..."
+                    }
+                }
+            )
+        }
+
+        let worktreesTask = Task.detached(priority: .userInitiated) {
+            await wAnalyzer.analyzeWorktrees(
+                in: rootToScan,
+                snapshot: snapshot,
+                shouldCancel: { cancelFlag.isCancelled }
+            )
+        }
 
         var allScanned: [CleanableItem] = []
         await withTaskGroup(of: [CleanableItem].self) { group in
@@ -95,20 +187,151 @@ public final class CleanerViewModel: ObservableObject {
             return a.physicalSize > b.physicalSize
         }
 
+        let hadPriorSelection = !selectedIDs.isEmpty
         self.items = allScanned
         self.simulatorRuntimes = runtimes
         self.storageMetrics = metrics
         self.freeSpaceBytes = metrics.macOSAvailableBytes
         self.lastScanDate = Date()
 
+        if !hadPriorSelection {
+            selectRecommendedSafeItems()
+        }
+
+        let (pReports, pSummary) = await projectsTask.value
+        let wRecords = await worktreesTask.value
+
+        self.projectReports = pReports
+        self.projectSummary = pSummary
+        self.worktreeRecords = wRecords
+        self.isScanningProjects = false
+        self.isScanningWorktrees = false
+        self.projectScanProgressText = ""
+
+        // Append cleanable project artifact items so they integrate with selection & preview
+        for report in pReports {
+            for artifact in report.artifacts where artifact.reclaimableBytes > 0 {
+                allScanned.append(artifact.cleanableItem)
+            }
+        }
+
+        allScanned.sort { a, b in
+            let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
+            let idxB = categoryOrder.firstIndex(of: b.category) ?? 99
+            if idxA != idxB { return idxA < idxB }
+            if a.riskLevel != b.riskLevel { return a.riskLevel < b.riskLevel }
+            return a.physicalSize > b.physicalSize
+        }
+
+        self.items = allScanned
         let validSelectableIDs = Set(allScanned.filter { $0.canBeSelected }.map { $0.id })
-        if selectedIDs.isEmpty {
+        if !hadPriorSelection {
             selectRecommendedSafeItems()
         } else {
             selectedIDs = selectedIDs.intersection(validSelectableIDs)
         }
 
         isScanning = false
+    }
+
+    public func rescanProjectsOnly() async {
+        guard !isScanningProjects else { return }
+        let cancelFlag = AtomicCancellationFlag()
+        self.projectScanCancellation = cancelFlag
+        self.isScanningProjects = true
+        self.isScanningWorktrees = true
+        let rootToScan = projectsRootPath
+        let snapshot = await ProcessMonitor.shared.captureSnapshot()
+        let pAnalyzer = self.projectAnalyzer
+        let wAnalyzer = self.worktreeAnalyzer
+
+        let (pReports, pSummary) = await Task.detached(priority: .userInitiated) {
+            await pAnalyzer.analyzeProjects(
+                in: rootToScan,
+                snapshot: snapshot,
+                shouldCancel: { cancelFlag.isCancelled },
+                onProgress: { index, total, projectName in
+                    Task { @MainActor in
+                        self.projectScanProgressText = "Analyzing project \(index)/\(total): \(projectName)..."
+                    }
+                }
+            )
+        }.value
+
+        let wRecords = await Task.detached(priority: .userInitiated) {
+            await wAnalyzer.analyzeWorktrees(
+                in: rootToScan,
+                snapshot: snapshot,
+                shouldCancel: { cancelFlag.isCancelled }
+            )
+        }.value
+
+        self.projectReports = pReports
+        self.projectSummary = pSummary
+        self.worktreeRecords = wRecords
+        self.isScanningProjects = false
+        self.isScanningWorktrees = false
+        self.projectScanProgressText = ""
+
+        // Replace .projectStorage items in self.items
+        var nonProjectItems = self.items.filter { $0.category != .projectStorage }
+        for report in pReports {
+            for artifact in report.artifacts where artifact.reclaimableBytes > 0 {
+                nonProjectItems.append(artifact.cleanableItem)
+            }
+        }
+        self.items = nonProjectItems
+    }
+
+    public func cancelProjectScan() {
+        projectScanCancellation?.cancel()
+        projectScanTask?.cancel()
+        isScanningProjects = false
+        isScanningWorktrees = false
+        projectScanProgressText = "Scan cancelled by user."
+    }
+
+    public func chooseProjectsRootFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Developer Projects Folder"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: projectsRootPath)
+        if panel.runModal() == .OK, let url = panel.url {
+            projectsRootPath = url.standardizedFileURL.path
+            Task {
+                await rescanProjectsOnly()
+            }
+        }
+    }
+
+    public func resetProjectsRootToDefault() {
+        projectsRootPath = ProjectStorageAnalyzer.defaultDeveloperRoot
+        Task {
+            await rescanProjectsOnly()
+        }
+    }
+
+    public func toggleSimulatorFavorite(udid: String) {
+        _ = FavoriteSimulatorsStore.shared.toggleFavorite(udid: udid)
+        selectedIDs.remove("sim-device-\(udid)")
+        Task {
+            let simCleaner = SimulatorCleaner()
+            let snapshot = await ProcessMonitor.shared.captureSnapshot()
+            let updatedSimItems = await simCleaner.scan(snapshot: snapshot, ageFilter: ageFilter)
+            var updated = items.filter { $0.category != .iosSimulators }
+            updated.append(contentsOf: updatedSimItems)
+            let categoryOrder = CleanerCategory.allCases
+            updated.sort { a, b in
+                let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
+                let idxB = categoryOrder.firstIndex(of: b.category) ?? 99
+                if idxA != idxB { return idxA < idxB }
+                if a.riskLevel != b.riskLevel { return a.riskLevel < b.riskLevel }
+                return a.physicalSize > b.physicalSize
+            }
+            self.items = updated
+        }
     }
 
     public func selectRecommendedSafeItems() {
@@ -119,6 +342,29 @@ public final class CleanerViewModel: ObservableObject {
                 .map { $0.id }
         )
         statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items, protected subtrees, simulators, VMs, and AI models are excluded."
+    }
+
+    public func selectSafeProjectArtifactsOnly() {
+        let safeProjectIDs = items
+            .filter { $0.category == .projectStorage && $0.riskLevel == .safe && $0.canBeSelected && $0.reclaimableSize > 0 }
+            .map { $0.id }
+        for id in safeProjectIDs {
+            selectedIDs.insert(id)
+        }
+        statusBannerMessage = "Selected \(safeProjectIDs.count) verified SAFE project caches & builds."
+    }
+
+    public func clearProjectArtifactSelections() {
+        let projectIDs = Set(items.filter { $0.category == .projectStorage }.map { $0.id })
+        selectedIDs.subtract(projectIDs)
+    }
+
+    public var selectedProjectItems: [CleanableItem] {
+        selectedItems.filter { $0.category == .projectStorage }
+    }
+
+    public var selectedProjectReclaimableBytes: Int64 {
+        selectedProjectItems.reduce(0) { $0 + $1.reclaimableSize }
     }
 
     public func activateDevelopmentCleanupMode(filter: AgeFilter = .sevenDays) {
@@ -187,7 +433,11 @@ public final class CleanerViewModel: ObservableObject {
     }
 
     public func inspectInFinder(_ item: CleanableItem) {
-        let expanded = (item.path as NSString).expandingTildeInPath
+        inspectPathInFinder(item.path)
+    }
+
+    public func inspectPathInFinder(_ rawPath: String) {
+        let expanded = (rawPath as NSString).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded)
         if FileManager.default.fileExists(atPath: expanded) {
             NSWorkspace.shared.activateFileViewerSelecting([url])

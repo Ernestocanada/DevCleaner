@@ -33,6 +33,7 @@ public enum CleanerCategory: String, Codable, CaseIterable, Identifiable, Sendab
     case codex = "Codex"
     case googleAI = "Google AI local models"
     case generalCaches = "General developer caches"
+    case projectStorage = "Project Storage"
 
     public var id: String { rawValue }
 
@@ -50,6 +51,7 @@ public enum CleanerCategory: String, Codable, CaseIterable, Identifiable, Sendab
         case .codex: return "terminal.fill"
         case .googleAI: return "brain.head.profile"
         case .generalCaches: return "folder.fill.badge.gearshape"
+        case .projectStorage: return "folder.badge.gearshape"
         }
     }
 }
@@ -57,6 +59,7 @@ public enum CleanerCategory: String, Codable, CaseIterable, Identifiable, Sendab
 public enum CleanupActionType: Codable, Equatable, Sendable {
     case moveToTrash(path: String)
     case moveToTrashContents(directoryPath: String, minAgeDays: Int?)
+    case moveToTrashVerifiedProjectArtifact(path: String, projectRoot: String, expectedModifiedAt: Date?)
     case simctlDeleteDevice(udid: String)
     case simctlDeleteUnavailable
     case simctlDeleteRuntime(identifier: String)
@@ -236,13 +239,28 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
     public let state: String
     public let isAvailable: Bool
     public let lastUsedAt: Date?
+    public let installedAppNames: [String]
+    public let hasLocalData: Bool
+    public let isFavorite: Bool
 
-    public init(udid: String, runtimeName: String, state: String, isAvailable: Bool, lastUsedAt: Date?) {
+    public init(
+        udid: String,
+        runtimeName: String,
+        state: String,
+        isAvailable: Bool,
+        lastUsedAt: Date?,
+        installedAppNames: [String] = [],
+        hasLocalData: Bool = false,
+        isFavorite: Bool = false
+    ) {
         self.udid = udid
         self.runtimeName = runtimeName
         self.state = state
         self.isAvailable = isAvailable
         self.lastUsedAt = lastUsedAt
+        self.installedAppNames = installedAppNames
+        self.hasLocalData = hasLocalData
+        self.isFavorite = isFavorite
     }
 
     public var isBooted: Bool {
@@ -255,6 +273,9 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
         }
         if isBooted {
             return "ACTIVE — protected"
+        }
+        if isFavorite {
+            return "FAVORITE — protected"
         }
         return state.uppercased()
     }
@@ -279,6 +300,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
     public let simulatorMetadata: SimulatorMetadata?
     public let supportsAgeFilter: Bool
     public let plan: CleanupPlan?
+    public let requiresRedownload: Bool
+    public let affectsSessionsOrConfig: Bool
 
     public init(
         id: String,
@@ -298,7 +321,9 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         actionType: CleanupActionType,
         simulatorMetadata: SimulatorMetadata? = nil,
         supportsAgeFilter: Bool = false,
-        plan: CleanupPlan? = nil
+        plan: CleanupPlan? = nil,
+        requiresRedownload: Bool = false,
+        affectsSessionsOrConfig: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -318,11 +343,14 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         self.simulatorMetadata = simulatorMetadata
         self.supportsAgeFilter = supportsAgeFilter
         self.plan = plan
+        self.requiresRedownload = requiresRedownload
+        self.affectsSessionsOrConfig = affectsSessionsOrConfig
     }
 
     public var canBeSelected: Bool {
         guard riskLevel != .neverDelete else { return false }
         guard !isRunningDependency else { return false }
+        if simulatorMetadata?.isFavorite == true { return false }
         if case .readOnlyInfo = actionType { return false }
         if case .dockerPrune = actionType { return true }
         return reclaimableSize > 0 || actionType == .simctlDeleteUnavailable
@@ -336,7 +364,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
 
     public var actionKind: CleanupResultAction {
         switch actionType {
-        case .moveToTrash, .moveToTrashContents:
+        case .moveToTrash, .moveToTrashContents, .moveToTrashVerifiedProjectArtifact:
             return .moveToTrash
         case .simctlDeleteDevice, .simctlDeleteUnavailable, .simctlDeleteRuntime:
             return .simctlDelete
@@ -356,6 +384,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
                 return "\(dir)/* (older than \(d) days)"
             }
             return "\(dir)/*"
+        case .moveToTrashVerifiedProjectArtifact(let p, _, _):
+            return p
         case .simctlDeleteDevice(let udid):
             return "xcrun simctl delete \(udid)"
         case .simctlDeleteUnavailable:

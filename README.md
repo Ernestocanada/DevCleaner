@@ -18,16 +18,18 @@ The project was designed around one rule: **safety is more important than maximu
 
 DevCleaner can inspect and classify storage used by:
 
+- **Project Storage Analyzer** (`~/Developer` or custom directory): per-project breakdown of regenerable caches (`.next`, `.expo`, `.turbo`, `.metro`, verified `.cache/npm`, `.cache/pnpm`, `.cache/corepack`), build outputs (`.build`, verified Android Gradle `build`, verified local Xcode `DerivedData` and `SYMROOT`), dependencies (`node_modules`, `ios/Pods`), `.xcresult` bundles, worktrees, and protected project files
+- **Git & Claude Worktree Analyzer** (read-only informative mode): inspects linked Git worktrees, `.claude/worktrees`, and `~/.codex/worktrees` via `git worktree list --porcelain` and `git status --porcelain --branch`
 - Xcode DerivedData, logs and application caches
-- iOS / watchOS simulator devices and unavailable simulators
-- Android SDK / emulator-related data
+- iOS / watchOS simulator devices (grouped by runtime version, with installed app detection and **Favorites** protection) and unavailable simulators
+- Android SDK, NDK, system images, AVD virtual devices (with live PID lock verification), and temporary caches
 - Gradle caches
 - npm caches and temporary npx packages
 - CocoaPods and Swift Package Manager caches
 - Homebrew downloads
 - Docker data and build caches
-- Claude caches, simulator builds and VM bundles
-- Codex caches and runtimes
+- Claude caches, superseded `claude-code` tool versions, simulator builds and VM bundles (while strictly protecting sessions and configurations)
+- Codex caches and runtimes (`codex-primary-runtime` and staged `codex-runtime-install-*`)
 - Google local AI models and model caches
 - Other known developer caches
 

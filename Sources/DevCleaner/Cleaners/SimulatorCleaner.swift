@@ -1,5 +1,41 @@
 import Foundation
 
+public final class FavoriteSimulatorsStore: @unchecked Sendable {
+    public static let shared = FavoriteSimulatorsStore()
+    private let defaultsKey = "DevCleaner.FavoriteSimulatorUDIDs"
+    private let lock = NSLock()
+
+    public init() {}
+
+    public func favoriteUDIDs() -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        let list = UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
+        return Set(list)
+    }
+
+    public func isFavorite(udid: String) -> Bool {
+        favoriteUDIDs().contains(udid)
+    }
+
+    @discardableResult
+    public func toggleFavorite(udid: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        var current = Set(UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [])
+        let nowFavorite: Bool
+        if current.contains(udid) {
+            current.remove(udid)
+            nowFavorite = false
+        } else {
+            current.insert(udid)
+            nowFavorite = true
+        }
+        UserDefaults.standard.set(Array(current).sorted(), forKey: defaultsKey)
+        return nowFavorite
+    }
+}
+
 public struct SimulatorCleaner: CleanerProvider {
     public let category: CleanerCategory = .iosSimulators
     private let home: String
@@ -119,7 +155,35 @@ public struct SimulatorCleaner: CleanerProvider {
         return key
     }
 
-    public static func parseDevicesJSON(_ data: Data, homeDirectory: String) throws -> [CleanableItem] {
+    public static func detectInstalledApps(inDataPath dataPath: String) -> [String] {
+        let fm = FileManager.default
+        let appsRoot = URL(fileURLWithPath: dataPath).appendingPathComponent("Containers/Bundle/Application")
+        guard let uuidDirs = try? fm.contentsOfDirectory(
+            at: appsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        var appNames: [String] = []
+        for uuidDir in uuidDirs {
+            guard let children = try? fm.contentsOfDirectory(
+                at: uuidDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for child in children where child.pathExtension == "app" {
+                appNames.append(child.deletingPathExtension().lastPathComponent)
+            }
+        }
+        return Array(Set(appNames)).sorted()
+    }
+
+    public static func parseDevicesJSON(
+        _ data: Data,
+        homeDirectory: String,
+        favoriteUDIDs: Set<String> = []
+    ) throws -> [CleanableItem] {
         let decoded = try JSONDecoder().decode(SimctlDevicesResponse.self, from: data)
         let isoFormatter = ISO8601DateFormatter()
         var items: [CleanableItem] = []
@@ -137,24 +201,44 @@ public struct SimulatorCleaner: CleanerProvider {
                 }
 
                 let isBooted = dev.state.caseInsensitiveCompare("Shutdown") != .orderedSame
-
-                // List simulators that consume meaningful disk space (>10 MB), are booted, or are unavailable with data
-                guard size > 10 * 1024 * 1024 || isBooted else { continue }
+                guard size > 0 || isBooted || !isAvailable else { continue }
 
                 let lastUsed: Date? = dev.lastUsedAt != nil ? isoFormatter.date(from: dev.lastUsedAt!) : nil
                 let devicePath = dev.dataPath ?? "\(homeDirectory)/Library/Developer/CoreSimulator/Devices/\(dev.udid)/data"
+                let installedApps = detectInstalledApps(inDataPath: devicePath)
+                let hasLocalData = !installedApps.isEmpty || size > 100 * 1024 * 1024
+                let isFavorite = favoriteUDIDs.contains(dev.udid)
 
                 let meta = SimulatorMetadata(
                     udid: dev.udid,
                     runtimeName: runtimeLabel,
                     state: dev.state,
                     isAvailable: isAvailable,
-                    lastUsedAt: lastUsed
+                    lastUsedAt: lastUsed,
+                    installedAppNames: installedApps,
+                    hasLocalData: hasLocalData,
+                    isFavorite: isFavorite
                 )
 
-                // Unavailable/orphaned => SAFE; Shutdown => REVIEW; Booted => protected
+                // Unavailable/orphaned => SAFE; Shutdown => REVIEW; Booted or Favorite => protected
                 let itemRisk: RiskLevel = isAvailable ? .review : .safe
-                let stateNote = isBooted ? "ACTIVE — protected (\(dev.state))" : (isAvailable ? dev.state : "Unavailable / Orphaned")
+                let stateNote: String = {
+                    if isBooted { return "ACTIVE — protected (\(dev.state))" }
+                    if isFavorite { return "FAVORITE — protected" }
+                    return isAvailable ? dev.state : "Unavailable / Orphaned"
+                }()
+
+                let appsSummary: String = {
+                    if !installedApps.isEmpty {
+                        return " Installed apps (\(installedApps.count)): \(installedApps.joined(separator: ", "))."
+                    }
+                    if hasLocalData {
+                        return " Contains local simulator container data."
+                    }
+                    return " No installed user apps detected (clean template state)."
+                }()
+
+                let reclaimable: Int64 = (isBooted || isFavorite) ? 0 : size
 
                 items.append(
                     CleanableItem(
@@ -164,10 +248,10 @@ public struct SimulatorCleaner: CleanerProvider {
                         path: devicePath,
                         logicalSize: size,
                         physicalSize: size,
-                        reclaimableSize: isBooted ? 0 : size,
+                        reclaimableSize: reclaimable,
                         lastModified: lastUsed,
                         riskLevel: itemRisk,
-                        explanation: "Device: \(dev.name) • Runtime: \(runtimeLabel) • State: \(stateNote). Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
+                        explanation: "Device: \(dev.name) • Runtime: \(runtimeLabel) • State: \(stateNote).\(appsSummary) Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
                         deletionConsequence: "Deletes this simulator device and its app sandbox data via official 'xcrun simctl delete \(dev.udid)'.",
                         regenerationImpact: "Simulator device can be recreated in Xcode if needed; installed simulator apps will need a fresh build.",
                         isRunningDependency: isBooted,
@@ -179,7 +263,12 @@ public struct SimulatorCleaner: CleanerProvider {
             }
         }
 
-        items.sort { $0.physicalSize > $1.physicalSize }
+        items.sort { lhs, rhs in
+            if lhs.physicalSize != rhs.physicalSize {
+                return lhs.physicalSize > rhs.physicalSize
+            }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
 
         items.insert(
             CleanableItem(
@@ -213,12 +302,13 @@ public struct SimulatorCleaner: CleanerProvider {
                 reclaimableSize: 0,
                 lastModified: nil,
                 riskLevel: .neverDelete,
-                explanation: "System-mounted simulator runtime images (iOS 26.3 & iOS 27.0). Protected by default and never deleted manually.",
+                explanation: "System-mounted simulator runtime images (iOS 26.3 & iOS 27.0) in /Library/Developer/CoreSimulator (~19.6 GB managed by macOS/Xcode). Protected by default and never deleted manually.",
                 deletionConsequence: "Never deleted automatically. Use 'Advanced Runtime Manager' if you explicitly need to inspect or remove runtimes via simctl.",
                 regenerationImpact: "Re-downloading an iOS runtime requires an 8–15 GB download in Xcode.",
                 isRunningDependency: false,
                 runningProcessNames: [],
-                actionType: .readOnlyInfo(reason: "Mounted simulator runtime volumes are preserved by default.")
+                actionType: .readOnlyInfo(reason: "Mounted simulator runtime volumes are preserved by default."),
+                requiresRedownload: true
             )
         )
 
@@ -227,8 +317,9 @@ public struct SimulatorCleaner: CleanerProvider {
 
     public func scan(snapshot: ActiveProcessSnapshot, ageFilter: AgeFilter) async -> [CleanableItem] {
         let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "list", "devices", "-j"])
+        let favs = FavoriteSimulatorsStore.shared.favoriteUDIDs()
         guard res.isSuccess, let data = res.stdout.data(using: .utf8),
-              let parsed = try? Self.parseDevicesJSON(data, homeDirectory: home) else {
+              let parsed = try? Self.parseDevicesJSON(data, homeDirectory: home, favoriteUDIDs: favs) else {
             return []
         }
         return parsed

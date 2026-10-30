@@ -12,6 +12,8 @@ public struct DashboardView: View {
         VStack(spacing: 0) {
             headerSection
             Divider()
+            tabSelectorBar
+            Divider()
 
             if let summary = viewModel.lastCleanupSummary {
                 lastCleanupBanner(summary: summary)
@@ -37,43 +39,13 @@ public struct DashboardView: View {
                 Divider()
             }
 
-            if viewModel.isScanning && viewModel.items.isEmpty {
-                VStack(spacing: 14) {
-                    Spacer()
-                    ProgressView()
-                        .scaleEffect(1.2)
-                    Text("Scanning developer caches & virtual devices (read-only)...")
-                        .font(.headline)
-                    Text("Staying on local APFS filesystem (du -x), ignoring virtual CoreDevice mounts.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(CleanerCategory.allCases) { category in
-                            let catItems = viewModel.items(for: category)
-                            if !catItems.isEmpty {
-                                CategoryCardView(
-                                    category: category,
-                                    items: catItems,
-                                    isExpanded: expandedCategories.contains(category),
-                                    onToggleExpand: {
-                                        if expandedCategories.contains(category) {
-                                            expandedCategories.remove(category)
-                                        } else {
-                                            expandedCategories.insert(category)
-                                        }
-                                    },
-                                    viewModel: viewModel
-                                )
-                            }
-                        }
-                    }
-                    .padding(20)
-                }
+            switch viewModel.selectedTab {
+            case .systemAndTools:
+                systemAndToolsContent
+            case .projectStorage:
+                ProjectStorageAnalyzerView(viewModel: viewModel)
+            case .worktrees:
+                WorktreeAnalyzerView(viewModel: viewModel)
             }
 
             Divider()
@@ -100,6 +72,91 @@ public struct DashboardView: View {
         .task {
             if viewModel.lastScanDate == nil {
                 await viewModel.performScan()
+            }
+        }
+    }
+
+    private var tabSelectorBar: some View {
+        HStack(spacing: 10) {
+            ForEach(MainAnalyzerTab.allCases) { tab in
+                let isSelected = viewModel.selectedTab == tab
+                Button {
+                    viewModel.selectedTab = tab
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: tab.iconName)
+                        Text(tab.rawValue)
+                            .font(.subheadline.weight(isSelected ? .bold : .medium))
+                        if tab == .projectStorage && viewModel.projectSummary.totalProjectsCount > 0 {
+                            Text("\(viewModel.projectSummary.totalProjectsCount) • \(Formatters.bytes(viewModel.projectSummary.totalProjectsPhysicalBytes))")
+                                .font(.caption2.monospacedDigit())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(isSelected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.15)))
+                        } else if tab == .worktrees && !viewModel.worktreeRecords.isEmpty {
+                            let wtBytes = viewModel.worktreeRecords.reduce(Int64(0)) { $0 + $1.physicalBytes }
+                            Text("\(viewModel.worktreeRecords.count) • \(Formatters.bytes(wtBytes))")
+                                .font(.caption2.monospacedDigit())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(isSelected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.15)))
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(isSelected ? Color.accentColor : Color.clear)
+                    )
+                    .foregroundColor(isSelected ? .white : .primary)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 7)
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    @ViewBuilder
+    private var systemAndToolsContent: some View {
+        if viewModel.isScanning && viewModel.items.isEmpty {
+            VStack(spacing: 14) {
+                Spacer()
+                ProgressView()
+                    .scaleEffect(1.2)
+                Text("Scanning developer caches, projects & virtual devices (read-only)...")
+                    .font(.headline)
+                Text("Staying on local APFS filesystem (st_dev check), deduplicating hardlinks, ignoring virtual CoreDevice mounts.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 14) {
+                    ForEach(CleanerCategory.allCases.filter { $0 != .projectStorage }) { category in
+                        let catItems = viewModel.items(for: category)
+                        if !catItems.isEmpty {
+                            CategoryCardView(
+                                category: category,
+                                items: catItems,
+                                isExpanded: expandedCategories.contains(category),
+                                onToggleExpand: {
+                                    if expandedCategories.contains(category) {
+                                        expandedCategories.remove(category)
+                                    } else {
+                                        expandedCategories.insert(category)
+                                    }
+                                },
+                                viewModel: viewModel
+                            )
+                        }
+                    }
+                }
+                .padding(20)
             }
         }
     }
@@ -179,6 +236,8 @@ public struct DashboardView: View {
     private static let storageMetricsHelpText = """
 macOS Available includes purgeable storage that macOS can reclaim automatically.
 Physical Free is the SSD space that is actually empty right now.
+Purgeable is the difference (macOS Available − Physical Free).
+In Trash shows items in ~/.Trash waiting to be permanently emptied.
 """
 
     @State private var showingStorageHelpPopover: Bool = false
@@ -192,12 +251,12 @@ Physical Free is the SSD space that is actually empty right now.
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Text("DevCleaner")
                                 .font(.system(size: 22, weight: .bold, design: .rounded))
-                            Text("Developer Storage Cleaner")
+                            Text("Developer Storage & Project Analyzer")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                         }
                         HStack(spacing: 14) {
-                            Label("Never touches ~/Developer or source code", systemImage: "lock.shield.fill")
+                            Label("Safety First: Verified Rules Only • Protects Code, Git, Certs & Sessions", systemImage: "lock.shield.fill")
                                 .font(.caption)
                                 .foregroundColor(.green)
                             if let scanDate = viewModel.lastScanDate {
@@ -212,18 +271,30 @@ Physical Free is the SSD space that is actually empty right now.
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 4) {
-                    HStack(alignment: .top, spacing: 20) {
+                    HStack(alignment: .top, spacing: 16) {
                         statMetric(
                             title: "macOS Available",
                             value: Formatters.bytes(viewModel.macOSAvailableBytes),
                             color: .primary,
-                            helpText: "Storage macOS says is available for important usage (can include purgeable space)."
+                            helpText: "Storage macOS says is available for important usage (includes purgeable space)."
                         )
                         statMetric(
                             title: "Physical Free",
                             value: Formatters.bytes(viewModel.physicalFreeBytes),
                             color: .secondary,
                             helpText: "Storage physically free on the SSD right now (excluding purgeable space)."
+                        )
+                        statMetric(
+                            title: "Purgeable",
+                            value: Formatters.bytes(viewModel.purgeableBytes),
+                            color: .secondary,
+                            helpText: "Purgeable APFS space managed by macOS (macOS Available minus Physical Free)."
+                        )
+                        statMetric(
+                            title: "In Trash",
+                            value: Formatters.bytes(viewModel.trashBytes),
+                            color: viewModel.trashBytes > 0 ? .orange : .secondary,
+                            helpText: "Space currently occupied by files in ~/.Trash (not yet freed on SSD)."
                         )
                         statMetric(
                             title: "Potential Cleanup",
@@ -252,19 +323,22 @@ Physical Free is the SSD space that is actually empty right now.
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("Understanding macOS Storage Metrics")
                                     .font(.caption.bold())
-                                Text("macOS Available includes purgeable storage that macOS can reclaim automatically.")
+                                Text("• macOS Available includes purgeable storage that macOS can reclaim automatically.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
-                                Text("Physical Free is the SSD space that is actually empty right now.")
+                                Text("• Physical Free is the SSD space that is actually empty right now.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("• In Trash shows files moved to ~/.Trash that still occupy blocks until Trash is emptied.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
                             .padding(12)
-                            .frame(width: 310)
+                            .frame(width: 340)
                         }
                     }
 
-                    Text("macOS Available includes purgeable storage that macOS can reclaim automatically. Physical Free is the SSD space that is actually empty right now.")
+                    Text("macOS Available includes purgeable storage. Physical Free is actual empty SSD space. Moving to Trash frees blocks after Trash is emptied.")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                         .help(Self.storageMetricsHelpText)
@@ -313,7 +387,7 @@ Physical Free is the SSD space that is actually empty right now.
                 Button {
                     viewModel.openTrashInFinder()
                 } label: {
-                    Label("Open Trash", systemImage: "trash")
+                    Label("Open Trash (\(Formatters.bytes(viewModel.trashBytes)))", systemImage: "trash")
                 }
                 .buttonStyle(.bordered)
 
@@ -336,7 +410,7 @@ Physical Free is the SSD space that is actually empty right now.
                 .font(.caption)
                 .foregroundColor(.secondary)
             Text(value)
-                .font(.system(size: 17, weight: .bold, design: .rounded).monospacedDigit())
+                .font(.system(size: 16, weight: .bold, design: .rounded).monospacedDigit())
                 .foregroundColor(color)
         }
         .help(helpText)
@@ -392,11 +466,22 @@ public struct CategoryCardView: View {
     @ObservedObject var viewModel: CleanerViewModel
 
     private var totalPhysical: Int64 {
-        items.reduce(0) { $0 + $1.physicalSize }
+        // For iOS Simulators, exclude the system-mounted runtime volume size from the ~/Library/Developer/CoreSimulator/Devices physical total if needed, or sum all items
+        items.filter { $0.id != "sim-runtimes-preserved" }.reduce(0) { $0 + $1.physicalSize }
     }
 
     private var totalPotentialCleanup: Int64 {
         items.filter { $0.riskLevel != .neverDelete }.reduce(0) { $0 + $1.reclaimableSize }
+    }
+
+    private var groupedSimulatorItems: [(runtimeName: String, devices: [CleanableItem])] {
+        let deviceItems = items.filter { $0.simulatorMetadata != nil }
+        let grouped = Dictionary(grouping: deviceItems) { $0.simulatorMetadata?.runtimeName ?? "Other" }
+        return grouped.map { key, list in
+            (key, list.sorted { $0.physicalSize > $1.physicalSize })
+        }.sorted { lhs, rhs in
+            lhs.runtimeName.localizedStandardCompare(rhs.runtimeName) == .orderedDescending
+        }
     }
 
     public var body: some View {
@@ -454,12 +539,16 @@ public struct CategoryCardView: View {
 
             if isExpanded {
                 Divider()
-                VStack(spacing: 0) {
-                    ForEach(items) { item in
-                        CleanableItemRow(item: item, viewModel: viewModel)
-                        if item.id != items.last?.id {
-                            Divider()
-                                .padding(.leading, 36)
+                if category == .iosSimulators {
+                    simulatorGroupedContent
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(items) { item in
+                            CleanableItemRow(item: item, viewModel: viewModel)
+                            if item.id != items.last?.id {
+                                Divider()
+                                    .padding(.leading, 36)
+                            }
                         }
                     }
                 }
@@ -471,6 +560,49 @@ public struct CategoryCardView: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
         )
+    }
+
+    private var simulatorGroupedContent: some View {
+        let nonDeviceTop = items.filter { $0.simulatorMetadata == nil && $0.id == "sim-delete-unavailable" }
+        let nonDeviceBottom = items.filter { $0.simulatorMetadata == nil && $0.id != "sim-delete-unavailable" }
+
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(nonDeviceTop) { item in
+                CleanableItemRow(item: item, viewModel: viewModel)
+                Divider()
+            }
+
+            ForEach(groupedSimulatorItems, id: \.runtimeName) { group in
+                let groupBytes = group.devices.reduce(Int64(0)) { $0 + $1.physicalSize }
+                HStack {
+                    Image(systemName: "iphone.gen3")
+                        .font(.caption.bold())
+                        .foregroundStyle(.blue)
+                    Text("Runtime Group: \(group.runtimeName)")
+                        .font(.caption.bold())
+                        .foregroundStyle(.blue)
+                    Text("(\(group.devices.count) simulators • \(Formatters.bytes(groupBytes)))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+                .background(Color.blue.opacity(0.06))
+
+                Divider()
+
+                ForEach(group.devices) { simItem in
+                    CleanableItemRow(item: simItem, viewModel: viewModel)
+                    Divider()
+                        .padding(.leading, 36)
+                }
+            }
+
+            ForEach(nonDeviceBottom) { item in
+                CleanableItemRow(item: item, viewModel: viewModel)
+            }
+        }
     }
 }
 
@@ -504,9 +636,59 @@ public struct CleanableItemRow: View {
                             .font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(sim.isBooted ? Color.green.opacity(0.18) : Color.secondary.opacity(0.15))
-                            .foregroundColor(sim.isBooted ? .green : .secondary)
+                            .background(
+                                sim.isBooted
+                                    ? Color.green.opacity(0.18)
+                                    : (sim.isFavorite ? Color.yellow.opacity(0.22) : Color.secondary.opacity(0.15))
+                            )
+                            .foregroundColor(
+                                sim.isBooted
+                                    ? .green
+                                    : (sim.isFavorite ? .orange : .secondary)
+                            )
                             .cornerRadius(4)
+
+                        if !sim.installedAppNames.isEmpty {
+                            Text("\(sim.installedAppNames.count) app\(sim.installedAppNames.count == 1 ? "" : "s") installed")
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.blue.opacity(0.12)))
+                                .foregroundStyle(.blue)
+                        } else if sim.hasLocalData {
+                            Text("Contains local data")
+                                .font(.system(size: 10, weight: .medium))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.purple.opacity(0.12)))
+                                .foregroundStyle(.purple)
+                        } else {
+                            Text("No user apps")
+                                .font(.system(size: 10))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.secondary.opacity(0.1)))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if item.category == .claude || item.category == .codex {
+                        if item.requiresRedownload {
+                            Text("Requires Re-download")
+                                .font(.system(size: 10, weight: .medium))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.orange.opacity(0.14)))
+                                .foregroundStyle(.orange)
+                        }
+                        if !item.affectsSessionsOrConfig && item.riskLevel != .neverDelete {
+                            Text("Sessions & Config Safe")
+                                .font(.system(size: 10, weight: .medium))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.green.opacity(0.12)))
+                                .foregroundStyle(.green)
+                        }
                     }
 
                     if item.isRunningDependency && item.simulatorMetadata == nil {
@@ -574,14 +756,28 @@ public struct CleanableItemRow: View {
             }
 
             VStack(alignment: .trailing, spacing: 6) {
-                Button {
-                    viewModel.inspectInFinder(item)
-                } label: {
-                    Label("Inspect", systemImage: "folder")
-                        .font(.caption)
+                HStack(spacing: 6) {
+                    if let sim = item.simulatorMetadata {
+                        Button {
+                            viewModel.toggleSimulatorFavorite(udid: sim.udid)
+                        } label: {
+                            Image(systemName: sim.isFavorite ? "star.fill" : "star")
+                                .foregroundStyle(sim.isFavorite ? .yellow : .secondary)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help(sim.isFavorite ? "Unmark Favorite Simulator" : "Mark Simulator as Favorite (protected from cleanup)")
+                    }
+
+                    Button {
+                        viewModel.inspectInFinder(item)
+                    } label: {
+                        Label("Inspect", systemImage: "folder")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
 
                 if item.riskLevel != .neverDelete {
                     Button {

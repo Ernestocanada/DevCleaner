@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public struct AndroidCleaner: CleanerProvider {
     public let category: CleanerCategory = .android
@@ -21,14 +22,124 @@ public struct AndroidCleaner: CleanerProvider {
         let runningProcs = snapshot.matchingProcesses(for: .android)
         let isEmulatorRunning = !runningProcs.isEmpty
 
-        // 1. Android SDK (Keep - NEVER DELETE automatically)
+        // 1. Android SDK & NDK / System Images / Emulator Breakdown (NEVER DELETE automatically)
         let sdkPath = "\(home)/Library/Android/sdk"
         if FileManager.default.fileExists(atPath: sdkPath) {
-            let usage = DiskScanner.shared.measurePath(sdkPath)
+            var sdkExcluded = Set<String>()
+
+            // 1a. Temporary SDK installer cache (~/Library/Android/sdk/.temp) -> SAFE if non-empty
+            let sdkTempPath = "\(sdkPath)/.temp"
+            if FileManager.default.fileExists(atPath: sdkTempPath) {
+                sdkExcluded.insert(URL(fileURLWithPath: sdkTempPath).standardizedFileURL.path)
+                let tempUsage = DiskScanner.shared.measurePath(sdkTempPath)
+                if tempUsage.physicalSize > 0 {
+                    let minDays = ageFilter != .all ? ageFilter.rawValue : nil
+                    let plan = planner.planDirectoryContents(
+                        directoryPath: sdkTempPath,
+                        baseRisk: .safe,
+                        ageFilter: ageFilter,
+                        supportsAgeFilter: true,
+                        isRunningDependency: false
+                    )
+                    items.append(
+                        CleanableItem(
+                            id: "android-sdk-temp",
+                            name: "Android SDK Temporary Download Cache (sdk/.temp)",
+                            category: .android,
+                            path: sdkTempPath,
+                            logicalSize: tempUsage.logicalSize,
+                            physicalSize: tempUsage.physicalSize,
+                            reclaimableSize: plan.eligibleBytes,
+                            lastModified: plan.latestModified ?? tempUsage.lastModified,
+                            riskLevel: .safe,
+                            explanation: "Temporary staging/download files created by Android SDK Manager inside ~/Library/Android/sdk/.temp.",
+                            deletionConsequence: "Moves temporary staging files in sdk/.temp to macOS Trash.",
+                            regenerationImpact: "Recreated automatically during SDK updates.",
+                            isRunningDependency: isEmulatorRunning,
+                            runningProcessNames: runningProcs,
+                            actionType: .moveToTrashContents(directoryPath: sdkTempPath, minAgeDays: minDays),
+                            supportsAgeFilter: true,
+                            plan: plan
+                        )
+                    )
+                }
+            }
+
+            // 1b. System Images (~/Library/Android/sdk/system-images) -> NEVER DELETE automatically
+            let sysImagesPath = "\(sdkPath)/system-images"
+            if FileManager.default.fileExists(atPath: sysImagesPath) {
+                sdkExcluded.insert(URL(fileURLWithPath: sysImagesPath).standardizedFileURL.path)
+                let sysUsage = DiskScanner.shared.measurePath(sysImagesPath)
+                if sysUsage.physicalSize > 0 {
+                    let versions = Self.listSubdirectoryNames(at: sysImagesPath)
+                    let versionNote = versions.isEmpty ? "" : " Installed: \(versions.joined(separator: ", "))."
+                    items.append(
+                        CleanableItem(
+                            id: "android-system-images-keep",
+                            name: "Android System Images (\(versions.isEmpty ? "system-images" : versions.joined(separator: ", ")))",
+                            category: .android,
+                            path: sysImagesPath,
+                            logicalSize: sysUsage.logicalSize,
+                            physicalSize: sysUsage.physicalSize,
+                            reclaimableSize: 0,
+                            lastModified: sysUsage.lastModified,
+                            riskLevel: .neverDelete,
+                            explanation: "Installed Android Emulator system images.\(versionNote)",
+                            deletionConsequence: "Protected: Never deleted automatically. Use Android Studio SDK Manager (`sdkmanager`) to manage system images.",
+                            regenerationImpact: "Re-downloading a system image requires a 1.5–3 GB download.",
+                            isRunningDependency: isEmulatorRunning,
+                            runningProcessNames: runningProcs,
+                            actionType: .readOnlyInfo(reason: "Android system images are preserved; manage via Android Studio SDK Manager."),
+                            requiresRedownload: true
+                        )
+                    )
+                }
+            }
+
+            // 1c. NDK Installations (~/Library/Android/sdk/ndk) -> NEVER DELETE automatically
+            let ndkPath = "\(sdkPath)/ndk"
+            if FileManager.default.fileExists(atPath: ndkPath) {
+                sdkExcluded.insert(URL(fileURLWithPath: ndkPath).standardizedFileURL.path)
+                let ndkUsage = DiskScanner.shared.measurePath(ndkPath)
+                if ndkUsage.physicalSize > 0 {
+                    let ndkVersions = Self.listSubdirectoryNames(at: ndkPath)
+                    let vLabel = ndkVersions.isEmpty ? "NDK" : "NDK \(ndkVersions.joined(separator: ", "))"
+                    items.append(
+                        CleanableItem(
+                            id: "android-ndk-keep",
+                            name: "Android \(vLabel) (Keep)",
+                            category: .android,
+                            path: ndkPath,
+                            logicalSize: ndkUsage.logicalSize,
+                            physicalSize: ndkUsage.physicalSize,
+                            reclaimableSize: 0,
+                            lastModified: ndkUsage.lastModified,
+                            riskLevel: .neverDelete,
+                            explanation: "Installed Native Development Kit toolchains (\(vLabel)) used by React Native / C++ native builds.",
+                            deletionConsequence: "Protected: Never deleted automatically. Manage NDK versions via Android Studio SDK Manager.",
+                            regenerationImpact: "Removing NDK breaks native C++/JSI compilation until re-downloaded (~1.8 GB).",
+                            isRunningDependency: isEmulatorRunning,
+                            runningProcessNames: runningProcs,
+                            actionType: .readOnlyInfo(reason: "Android NDK installations are preserved by design."),
+                            requiresRedownload: true
+                        )
+                    )
+                }
+            }
+
+            // 1d. Remaining Core Android SDK (emulator, build-tools, platforms, platform-tools) -> NEVER DELETE automatically
+            let usage = DiskScanner.shared.measurePath(sdkPath, excludedSubpaths: sdkExcluded)
+            let platforms = Self.listSubdirectoryNames(at: "\(sdkPath)/platforms")
+            let buildTools = Self.listSubdirectoryNames(at: "\(sdkPath)/build-tools")
+            var details: [String] = []
+            if !platforms.isEmpty { details.append("Platforms: \(platforms.joined(separator: ", "))") }
+            if !buildTools.isEmpty { details.append("Build-Tools: \(buildTools.joined(separator: ", "))") }
+            let detailSuffix = details.isEmpty ? "" : " (\(details.joined(separator: " • ")))"
+
             items.append(
                 CleanableItem(
                     id: "android-sdk-keep",
-                    name: "Android SDK (Keep)",
+                    name: "Android SDK Core, Platforms & Emulator (Keep)",
                     category: .android,
                     path: sdkPath,
                     logicalSize: usage.logicalSize,
@@ -36,12 +147,13 @@ public struct AndroidCleaner: CleanerProvider {
                     reclaimableSize: 0,
                     lastModified: usage.lastModified,
                     riskLevel: .neverDelete,
-                    explanation: "Core Android SDK platforms, build-tools, NDK, and system images.",
-                    deletionConsequence: "Preserved (Android SDK = keep). Manage individual SDK platforms inside Android Studio SDK Manager.",
+                    explanation: "Core Android SDK platforms, build-tools, platform-tools, and emulator binaries\(detailSuffix).",
+                    deletionConsequence: "Preserved (Android SDK = keep). Manage individual SDK components inside Android Studio SDK Manager.",
                     regenerationImpact: "Would require re-downloading Android SDK components.",
                     isRunningDependency: isEmulatorRunning,
                     runningProcessNames: runningProcs,
-                    actionType: .readOnlyInfo(reason: "Android SDK is preserved by design.")
+                    actionType: .readOnlyInfo(reason: "Android SDK is preserved by design."),
+                    requiresRedownload: true
                 )
             )
         }
@@ -61,13 +173,19 @@ public struct AndroidCleaner: CleanerProvider {
                 let usage = DiskScanner.shared.measurePath(entry.path)
                 guard usage.physicalSize > 0 else { continue }
 
-                let hasLock = FileManager.default.fileExists(atPath: entry.appendingPathComponent("hardware-qemu.ini.lock").path) ||
-                              FileManager.default.fileExists(atPath: entry.appendingPathComponent("multiinstance.lock").path)
-                let active = isEmulatorRunning || hasLock
+                let avdMeta = Self.parseAVDConfig(at: entry)
+                let liveLockPID = Self.activeLockPID(inAVDDirectory: entry)
+                let hasLiveLock = liveLockPID != nil
+                let active = isEmulatorRunning || hasLiveLock
                 var activeNames = runningProcs
-                if hasLock && !activeNames.contains("Android emulator (AVD Lock)") {
-                    activeNames.append("Android emulator (AVD Lock)")
+                if let pid = liveLockPID, !activeNames.contains(where: { $0.contains("AVD Lock") }) {
+                    activeNames.append("Android emulator (PID \(pid))")
                 }
+
+                let metaSummary = [avdMeta.displayName, avdMeta.androidVersionLabel, avdMeta.abi]
+                    .compactMap { $0 }
+                    .joined(separator: " • ")
+                let metaPrefix = metaSummary.isEmpty ? "" : "[\(metaSummary)] "
 
                 items.append(
                     CleanableItem(
@@ -80,9 +198,9 @@ public struct AndroidCleaner: CleanerProvider {
                         reclaimableSize: active ? 0 : usage.physicalSize,
                         lastModified: usage.lastModified,
                         riskLevel: .review,
-                        explanation: "Android Virtual Device disk image, userdata, and snapshots (\(avdName).avd).",
+                        explanation: "\(metaPrefix)Android Virtual Device disk image, userdata, and snapshots (\(avdName).avd). Review before deleting or manage via `avdmanager delete avd -n \(avdName)`.",
                         deletionConsequence: "Moves \(avdName).avd to macOS Trash. Never allowed while emulator/qemu is running.",
-                        regenerationImpact: "Requires recreating the virtual device in Android Studio Device Manager.",
+                        regenerationImpact: "Requires recreating the virtual device in Android Studio Device Manager and re-installing test apps.",
                         isRunningDependency: active,
                         runningProcessNames: activeNames,
                         actionType: .moveToTrash(path: entry.path)
@@ -129,6 +247,69 @@ public struct AndroidCleaner: CleanerProvider {
         }
 
         return items
+    }
+
+    public static func activeLockPID(inAVDDirectory avdURL: URL) -> Int32? {
+        for lockName in ["hardware-qemu.ini.lock", "multiinstance.lock"] {
+            let lockURL = avdURL.appendingPathComponent(lockName)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: lockURL.path, isDirectory: &isDir) else { continue }
+            let pidFileURL = isDir.boolValue ? lockURL.appendingPathComponent("pid") : lockURL
+            if let content = try? String(contentsOf: pidFileURL, encoding: .utf8) {
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let pid = Int32(trimmed), pid > 0 {
+                    // Check if process is actually alive
+                    if kill(pid, 0) == 0 {
+                        return pid
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    public static func parseAVDConfig(at avdURL: URL) -> (displayName: String?, androidVersionLabel: String?, abi: String?) {
+        let configURL = avdURL.appendingPathComponent("config.ini")
+        guard let content = try? String(contentsOf: configURL, encoding: .utf8) else {
+            return (nil, nil, nil)
+        }
+        var displayName: String?
+        var androidVersionLabel: String?
+        var abi: String?
+
+        for rawLine in content.components(separatedBy: .newlines) {
+            let parts = rawLine.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2 else { continue }
+            let key = parts[0]
+            let val = parts[1]
+            if key == "avd.ini.displayname" && !val.isEmpty {
+                displayName = val
+            } else if key == "abi.type" && !val.isEmpty {
+                abi = val
+            } else if key.hasPrefix("image.sysdir") {
+                // e.g. system-images/android-36.1/google_apis_playstore/arm64-v8a/
+                let comps = val.split(separator: "/").map(String.init)
+                if let apiComp = comps.first(where: { $0.hasPrefix("android-") }) {
+                    let apiNum = String(apiComp.dropFirst("android-".count))
+                    androidVersionLabel = "API \(apiNum)"
+                }
+            }
+        }
+        return (displayName, androidVersionLabel, abi)
+    }
+
+    private static func listSubdirectoryNames(at path: String) -> [String] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: URL(fileURLWithPath: path),
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        return entries.compactMap { url in
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            return isDir ? url.lastPathComponent : nil
+        }.sorted()
     }
 
     public func clean(_ item: CleanableItem, ageFilter: AgeFilter) async throws -> CleanupResult {
