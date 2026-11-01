@@ -27,6 +27,7 @@ public struct DockerCLIStats: Sendable, Equatable {
     public var buildCacheActiveCount: Int
     public var buildCacheSizeBytes: Int64
     public var buildCacheReclaimableBytes: Int64
+    public var buildCacheVerified: Bool
 
     public static let zero = DockerCLIStats(
         imagesTotalCount: 0,
@@ -47,7 +48,8 @@ public struct DockerCLIStats: Sendable, Equatable {
         buildCacheTotalCount: 0,
         buildCacheActiveCount: 0,
         buildCacheSizeBytes: 0,
-        buildCacheReclaimableBytes: 0
+        buildCacheReclaimableBytes: 0,
+        buildCacheVerified: false
     )
 
     public init(
@@ -69,7 +71,8 @@ public struct DockerCLIStats: Sendable, Equatable {
         buildCacheTotalCount: Int,
         buildCacheActiveCount: Int,
         buildCacheSizeBytes: Int64,
-        buildCacheReclaimableBytes: Int64
+        buildCacheReclaimableBytes: Int64,
+        buildCacheVerified: Bool = true
     ) {
         self.imagesTotalCount = imagesTotalCount
         self.imagesActiveCount = imagesActiveCount
@@ -90,6 +93,7 @@ public struct DockerCLIStats: Sendable, Equatable {
         self.buildCacheActiveCount = buildCacheActiveCount
         self.buildCacheSizeBytes = buildCacheSizeBytes
         self.buildCacheReclaimableBytes = buildCacheReclaimableBytes
+        self.buildCacheVerified = buildCacheVerified
     }
 }
 
@@ -160,7 +164,8 @@ public struct DockerCleaner: CleanerProvider {
 
         let statusDesc: String
         if daemonRunning, let stats {
-            let safeReclaimable = stats.danglingImagesReclaimableBytes + stats.containersReclaimableBytes + stats.buildCacheReclaimableBytes
+            let verifiedBuildCacheReclaimable = stats.buildCacheVerified ? stats.buildCacheReclaimableBytes : 0
+            let safeReclaimable = stats.danglingImagesReclaimableBytes + stats.containersReclaimableBytes + verifiedBuildCacheReclaimable
             statusDesc = "Docker Desktop is running (Images: \(stats.imagesTotalCount) [\(stats.danglingImagesCount) dangling], Containers: \(stats.containersRunningCount) running / \(stats.containersStoppedCount) stopped, Volumes: \(stats.volumesTotalCount), Reclaimable SAFE: \(Formatters.bytes(safeReclaimable)))."
         } else if daemonRunning {
             statusDesc = "Docker Desktop is running."
@@ -188,11 +193,33 @@ public struct DockerCleaner: CleanerProvider {
             )
         )
 
-        let buildCacheReclaimable = stats?.buildCacheReclaimableBytes ?? 0
+        let buildCacheVerified = stats?.buildCacheVerified ?? false
+        let buildCacheReclaimable = (daemonRunning && buildCacheVerified) ? (stats?.buildCacheReclaimableBytes ?? 0) : 0
         let buildCacheTotal = stats?.buildCacheSizeBytes ?? 0
-        let buildCacheDetail = stats != nil
-            ? " (Total: \(Formatters.bytes(buildCacheTotal)) • Reclaimable by prune: \(Formatters.bytes(buildCacheReclaimable)))"
-            : ""
+        let buildCacheDetail: String = {
+            guard stats != nil else { return "" }
+            if buildCacheVerified {
+                return " (Total: \(Formatters.bytes(buildCacheTotal)) • Reclaimable by prune: \(Formatters.bytes(buildCacheReclaimable)))"
+            } else {
+                return " (Total: \(Formatters.bytes(buildCacheTotal)) • Exact safe reclaimable size unverified)"
+            }
+        }()
+        let buildCacheExplanation: String = {
+            if !daemonRunning || stats != nil && buildCacheVerified {
+                return "Removes only non-in-use, unshared BuildKit cache layers that `docker builder prune -f` actually removes.\(buildCacheDetail)"
+            } else {
+                return "REVIEW: Exact safe reclaimable size for `docker builder prune -f` could not be verified from `docker builder du`. DevCleaner does not fall back to `docker system df` build-cache estimates for SAFE cleanup.\(buildCacheDetail)"
+            }
+        }()
+        let buildCacheAction: CleanupActionType = {
+            guard daemonRunning else {
+                return .readOnlyInfo(reason: "Docker Desktop is not running. Start Docker to use CLI cleanup.")
+            }
+            guard buildCacheVerified else {
+                return .readOnlyInfo(reason: "Exact safe reclaimable build-cache size could not be verified via 'docker builder du'.")
+            }
+            return .dockerPrune(subcommand: ["builder", "prune", "-f"])
+        }()
 
         let containersReclaimable = stats?.containersReclaimableBytes ?? 0
         let containersDetail = stats != nil
@@ -218,15 +245,16 @@ public struct DockerCleaner: CleanerProvider {
             ? " (\(stats!.volumesTotalCount) volumes, \(Formatters.bytes(volumesTotal)) total • Reclaimable: \(Formatters.bytes(volumesReclaimable)))"
             : ""
 
-        let pruneSpecs: [(id: String, name: String, args: [String], risk: RiskLevel, reclaimable: Int64, desc: String, requiresRedownload: Bool)] = [
+        let pruneSpecs: [(id: String, name: String, args: [String], risk: RiskLevel, reclaimable: Int64, desc: String, requiresRedownload: Bool, customAction: CleanupActionType?)] = [
             (
                 "docker-prune-build-cache",
                 "Docker Build Cache (docker builder prune -f)\(buildCacheDetail)",
                 ["builder", "prune", "-f"],
-                (daemonRunning && buildCacheReclaimable > 0) ? .safe : .review,
-                daemonRunning ? buildCacheReclaimable : 0,
-                "Removes only non-in-use, unshared BuildKit cache layers that `docker builder prune -f` actually removes.\(buildCacheDetail)",
-                false
+                (daemonRunning && buildCacheVerified && buildCacheReclaimable > 0) ? .safe : .review,
+                buildCacheReclaimable,
+                buildCacheExplanation,
+                false,
+                buildCacheAction
             ),
             (
                 "docker-prune-stopped-containers",
@@ -235,7 +263,8 @@ public struct DockerCleaner: CleanerProvider {
                 (daemonRunning && containersReclaimable > 0) ? .safe : .review,
                 daemonRunning ? containersReclaimable : 0,
                 "Removes stopped containers via official Docker CLI (`docker container ls -a`).\(containersDetail)",
-                false
+                false,
+                nil
             ),
             (
                 "docker-prune-dangling-images",
@@ -244,7 +273,8 @@ public struct DockerCleaner: CleanerProvider {
                 (daemonRunning && danglingImagesReclaimable > 0) ? .safe : .review,
                 daemonRunning ? danglingImagesReclaimable : 0,
                 "SAFE: Removes only untagged/dangling container images (`docker image ls -f dangling=true`). Tagged unused images are preserved.\(danglingImagesDetail)",
-                false
+                false,
+                nil
             ),
             (
                 "docker-prune-unused-images",
@@ -253,7 +283,8 @@ public struct DockerCleaner: CleanerProvider {
                 .review, // Always REVIEW: removes tagged images not currently used by any container
                 daemonRunning ? unusedNonDanglingReclaimable : 0,
                 "REVIEW: Removes unused container images beyond dangling ones (`docker image prune -a -f`). Re-pulling base images will require a network download.\(unusedImagesDetail)",
-                true
+                true,
+                nil
             ),
             (
                 "docker-prune-volumes",
@@ -262,11 +293,17 @@ public struct DockerCleaner: CleanerProvider {
                 .caution, // Volumes are ALWAYS CAUTION, never SAFE automatically
                 daemonRunning ? volumesReclaimable : 0,
                 "CAUTION: Permanently removes unused local Docker volumes (`docker volume ls`). May contain database or persistent container data.\(volumesDetail)",
-                false
+                false,
+                nil
             )
         ]
 
         for spec in pruneSpecs {
+            let resolvedAction: CleanupActionType = spec.customAction ?? (
+                daemonRunning
+                    ? .dockerPrune(subcommand: spec.args)
+                    : .readOnlyInfo(reason: "Docker Desktop is not running. Start Docker to use CLI cleanup.")
+            )
             items.append(
                 CleanableItem(
                     id: spec.id,
@@ -283,9 +320,7 @@ public struct DockerCleaner: CleanerProvider {
                     regenerationImpact: "Container images or build cache layers will be pulled/rebuilt on next docker build/run.",
                     isRunningDependency: false,
                     runningProcessNames: [],
-                    actionType: daemonRunning
-                        ? .dockerPrune(subcommand: spec.args)
-                        : .readOnlyInfo(reason: "Docker Desktop is not running. Start Docker to use CLI cleanup."),
+                    actionType: resolvedAction,
                     requiresRedownload: spec.requiresRedownload
                 )
             )
@@ -294,20 +329,30 @@ public struct DockerCleaner: CleanerProvider {
         return items
     }
 
-    public static func fetchLiveDockerCLIStats(dockerBinary: String) async -> DockerCLIStats {
-        async let dfRes = ShellRunner.shared.run(dockerBinary, arguments: ["system", "df", "--format", "{{json .}}"], timeoutSeconds: 8)
-        async let danglingRes = ShellRunner.shared.run(dockerBinary, arguments: ["image", "ls", "-f", "dangling=true", "--format", "{{.ID}}\t{{.Size}}"], timeoutSeconds: 5)
-        async let psRes = ShellRunner.shared.run(dockerBinary, arguments: ["container", "ls", "-a", "--format", "{{.State}}"], timeoutSeconds: 5)
-        async let imgRes = ShellRunner.shared.run(dockerBinary, arguments: ["image", "ls", "-q"], timeoutSeconds: 5)
-        async let volRes = ShellRunner.shared.run(dockerBinary, arguments: ["volume", "ls", "-q"], timeoutSeconds: 5)
-        async let builderJSONRes = ShellRunner.shared.run(dockerBinary, arguments: ["builder", "du", "--format", "{{json .}}"], timeoutSeconds: 5)
+    public static func fetchLiveDockerCLIStats(
+        dockerBinary: String,
+        runner: (@Sendable (String, [String]) async -> ShellResult)? = nil
+    ) async -> DockerCLIStats {
+        let exec: @Sendable (String, [String], TimeInterval) async -> ShellResult = { bin, args, timeout in
+            if let runner {
+                return await runner(bin, args)
+            }
+            return await ShellRunner.shared.run(bin, arguments: args, timeoutSeconds: timeout)
+        }
+
+        async let dfRes = exec(dockerBinary, ["system", "df", "--format", "{{json .}}"], 8)
+        async let danglingRes = exec(dockerBinary, ["image", "ls", "-f", "dangling=true", "--format", "{{.ID}}\t{{.Size}}"], 5)
+        async let psRes = exec(dockerBinary, ["container", "ls", "-a", "--format", "{{.State}}"], 5)
+        async let imgRes = exec(dockerBinary, ["image", "ls", "-q"], 5)
+        async let volRes = exec(dockerBinary, ["volume", "ls", "-q"], 5)
+        async let builderJSONRes = exec(dockerBinary, ["builder", "du", "--format", "{{json .}}"], 5)
 
         let (df, dangling, ps, img, vol, builderJSON) = await (dfRes, danglingRes, psRes, imgRes, volRes, builderJSONRes)
         let builderOutput: String?
         if builderJSON.isSuccess && !builderJSON.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             builderOutput = builderJSON.stdout
         } else {
-            let builderTable = await ShellRunner.shared.run(dockerBinary, arguments: ["builder", "du"], timeoutSeconds: 5)
+            let builderTable = await exec(dockerBinary, ["builder", "du"], 5)
             builderOutput = builderTable.isSuccess ? builderTable.stdout : nil
         }
 
@@ -382,7 +427,10 @@ public struct DockerCleaner: CleanerProvider {
                 stats.buildCacheTotalCount = totalCount
                 stats.buildCacheActiveCount = activeCount
                 stats.buildCacheSizeBytes = sizeBytes
-                stats.buildCacheReclaimableBytes = reclaimableBytes
+                // Do NOT fall back to `docker system df` build-cache reclaimable bytes for SAFE cleanup.
+                // Reclaimable bytes remain 0 and unverified until `docker builder du` is parsed reliably.
+                stats.buildCacheReclaimableBytes = 0
+                stats.buildCacheVerified = false
             }
         }
 
@@ -398,11 +446,11 @@ public struct DockerCleaner: CleanerProvider {
         }
 
         if let builderDUOutput, let builderPruneBytes = parseDockerBuilderDUOutput(builderDUOutput) {
-            if stats.buildCacheReclaimableBytes > 0 {
-                stats.buildCacheReclaimableBytes = min(stats.buildCacheReclaimableBytes, builderPruneBytes)
-            } else {
-                stats.buildCacheReclaimableBytes = builderPruneBytes
-            }
+            stats.buildCacheReclaimableBytes = builderPruneBytes
+            stats.buildCacheVerified = true
+        } else {
+            stats.buildCacheReclaimableBytes = 0
+            stats.buildCacheVerified = false
         }
 
         return stats
@@ -455,52 +503,108 @@ public struct DockerCleaner: CleanerProvider {
     }
 
     /// Parses `docker builder du` output (JSON lines or tabular) and returns only the bytes that `docker builder prune -f` will actually remove (Reclaimable == true, InUse == false, Shared == false).
+    /// Returns `nil` if the output is empty, malformed, or in an unsupported format.
     public static func parseDockerBuilderDUOutput(_ output: String) -> Int64? {
         let lines = output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         guard !lines.isEmpty else { return nil }
 
         var parsedAnyRecord = false
+        var sawTableHeader = false
         var reclaimableBytes: Int64 = 0
 
         for line in lines {
             if line.hasPrefix("{") {
                 guard let data = line.data(using: .utf8),
-                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    continue
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let id = dict["ID"] as? String, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let rawSize = dict["Size"] as? String else {
+                    return nil
                 }
+                let hasReclaimableOrInUse = (dict["Reclaimable"] != nil) || (dict["InUse"] != nil)
+                guard hasReclaimableOrInUse else { return nil }
+
+                let cleanSize = rawSize.replacingOccurrences(of: "*", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard isValidDockerSizeString(cleanSize) else { return nil }
+
+                guard let inUse = parseStrictBool(dict["InUse"], defaultIfNil: false),
+                      let reclaimable = parseStrictBool(dict["Reclaimable"], defaultIfNil: true),
+                      let shared = parseStrictBool(dict["Shared"], defaultIfNil: false) else {
+                    return nil
+                }
+
                 parsedAnyRecord = true
-                let inUse = (dict["InUse"] as? Bool) ?? ((String(describing: dict["InUse"] ?? "false")).lowercased() == "true")
-                let reclaimable = (dict["Reclaimable"] as? Bool) ?? ((String(describing: dict["Reclaimable"] ?? "true")).lowercased() == "true")
-                let shared = (dict["Shared"] as? Bool) ?? ((String(describing: dict["Shared"] ?? "false")).lowercased() == "true")
-                let sizeStr = (dict["Size"] as? String ?? "0B").replacingOccurrences(of: "*", with: "")
-                if reclaimable && !inUse && !shared {
-                    reclaimableBytes += parseDockerSizeString(sizeStr)
+                if reclaimable && !inUse && !shared && !rawSize.hasSuffix("*") {
+                    reclaimableBytes += parseDockerSizeString(cleanSize)
                 }
                 continue
             }
 
             let lower = line.lowercased()
-            if lower.hasPrefix("id ") || lower.hasPrefix("id\t") || lower.hasPrefix("reclaimable:") || lower.hasPrefix("total:") {
-                if lower.hasPrefix("id ") || lower.hasPrefix("id\t") || lower.hasPrefix("total:") {
-                    parsedAnyRecord = true
+            if (lower.hasPrefix("id ") || lower.hasPrefix("id\t")) && lower.contains("reclaimable") && lower.contains("size") {
+                sawTableHeader = true
+                continue
+            }
+            if lower.hasPrefix("reclaimable:") || lower.hasPrefix("total:") {
+                let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                guard parts.count == 2, isValidDockerSizeString(parts[1]) else {
+                    return nil
                 }
                 continue
             }
 
             let cols = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-            guard cols.count >= 3 else { continue }
+            guard cols.count >= 3 else { return nil }
             let reclaimableCol = cols[1].lowercased()
             let sizeCol = cols[2]
-            if reclaimableCol == "true" || reclaimableCol == "false" || reclaimableCol == "true*" {
-                parsedAnyRecord = true
-                // Exclude "true*" or size ending with "*" (shared cache not removed by default prune)
-                if reclaimableCol == "true" && !sizeCol.hasSuffix("*") {
-                    reclaimableBytes += parseDockerSizeString(sizeCol)
-                }
+            guard reclaimableCol == "true" || reclaimableCol == "false" || reclaimableCol == "true*" else {
+                return nil
+            }
+            let cleanSizeCol = sizeCol.replacingOccurrences(of: "*", with: "")
+            guard isValidDockerSizeString(cleanSizeCol) else {
+                return nil
+            }
+
+            parsedAnyRecord = true
+            // Exclude "true*" or size ending with "*" (shared cache not removed by default prune)
+            if reclaimableCol == "true" && !sizeCol.hasSuffix("*") {
+                reclaimableBytes += parseDockerSizeString(cleanSizeCol)
             }
         }
 
-        return parsedAnyRecord ? reclaimableBytes : nil
+        return (parsedAnyRecord || sawTableHeader) ? reclaimableBytes : nil
+    }
+
+    private static func parseStrictBool(_ raw: Any?, defaultIfNil: Bool) -> Bool? {
+        guard let raw else { return defaultIfNil }
+        if let b = raw as? Bool { return b }
+        let str = String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if str == "true" { return true }
+        if str == "false" { return false }
+        return nil
+    }
+
+    public static func isValidDockerSizeString(_ raw: String) -> Bool {
+        let mainPart = raw.split(separator: " ").first.map(String.init) ?? raw
+        let trimmed = mainPart.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        var numberStr = ""
+        var unitStr = ""
+        var seenLetter = false
+        for ch in trimmed {
+            if ch.isNumber || ch == "." {
+                if seenLetter { return false }
+                numberStr.append(ch)
+            } else if ch.isLetter {
+                seenLetter = true
+                unitStr.append(ch)
+            } else {
+                return false
+            }
+        }
+        guard Double(numberStr) != nil else { return false }
+        let unit = unitStr.uppercased()
+        return ["B", "KB", "KIB", "MB", "MIB", "GB", "GIB", "TB", "TIB"].contains(unit)
     }
 
     public static func parseDockerSizeString(_ raw: String) -> Int64 {

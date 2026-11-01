@@ -390,7 +390,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         guard !isRunningDependency else { return false }
         if simulatorMetadata?.isFavorite == true { return false }
         if case .readOnlyInfo = actionType { return false }
-        if case .dockerPrune = actionType { return true }
+        if case .dockerPrune = actionType { return reclaimableSize > 0 }
         return reclaimableSize > 0 || actionType == .simctlDeleteUnavailable
     }
 

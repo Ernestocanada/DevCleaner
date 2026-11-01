@@ -384,10 +384,130 @@ final class MacStorageManagerTests: XCTestCase {
         XCTAssertNotEqual(volumes.riskLevel, .safe)
         XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(volumes))
 
-        // When `docker system df` is parsed WITHOUT `docker image ls -f dangling=true`, danglingImagesReclaimableBytes is conservatively 0
+        // When `docker system df` is parsed WITHOUT `docker image ls -f dangling=true` or `docker builder du`,
+        // both danglingImagesReclaimableBytes and buildCacheReclaimableBytes are conservatively 0 and buildCacheVerified is false.
         let dfOnlyStats = DockerCleaner.parseDockerSystemDFJSONLines(dfOutput)
         XCTAssertEqual(dfOnlyStats.danglingImagesReclaimableBytes, 0)
         XCTAssertEqual(dfOnlyStats.unusedNonDanglingImagesReclaimableBytes, 1_500_000_000)
+        XCTAssertEqual(dfOnlyStats.buildCacheReclaimableBytes, 0)
+        XCTAssertFalse(dfOnlyStats.buildCacheVerified)
+    }
+
+    func testDockerBuilderCacheUnverifiedMalformedAndCommandFailureFallbacks() async throws {
+        let dfOutputWith500MBBuildCache = """
+        {"Active":"1","Reclaimable":"1.5GB (50%)","Size":"3GB","TotalCount":"4","Type":"Images"}
+        {"Active":"0","Reclaimable":"250MB (100%)","Size":"250MB","TotalCount":"2","Type":"Containers"}
+        {"Active":"1","Reclaimable":"800MB (40%)","Size":"2GB","TotalCount":"3","Type":"Local Volumes"}
+        {"Active":"0","Reclaimable":"500MB","Size":"500MB","TotalCount":"12","Type":"Build Cache"}
+        """
+        let danglingOutput = "sha256:aaa111\t300MB\n"
+        let mockDisk = DiskUsageInfo(logicalSize: 64_000_000_000, physicalSize: 11_260_000_000, lastModified: Date(), fileCount: 1)
+
+        // 1. Valid `docker builder du` -> exact SAFE reclaimable bytes (only confirmed removable bytes, not 500MB from system df)
+        let validTabularBuilderDU = """
+        ID                                              RECLAIMABLE   SIZE      LAST ACCESSED
+        cache001                                        true          180MB     2 days ago
+        cache002                                        true*         200MB*    3 days ago
+        cache003                                        false         120MB     1 hour ago
+        Reclaimable: 180MB
+        Total: 500MB
+        """
+        let validStats = DockerCleaner.parseDockerSystemDFJSONLines(
+            dfOutputWith500MBBuildCache,
+            danglingImagesOutput: danglingOutput,
+            builderDUOutput: validTabularBuilderDU
+        )
+        XCTAssertTrue(validStats.buildCacheVerified)
+        XCTAssertEqual(validStats.buildCacheReclaimableBytes, 180_000_000)
+
+        let validItems = await DockerCleaner(
+            homeDirectory: tempHome.path,
+            daemonRunningOverride: true,
+            diskUsageOverride: mockDisk,
+            cliStatsOverride: validStats
+        ).scan(snapshot: .empty, ageFilter: .all)
+        let validBuildCacheItem = try XCTUnwrap(validItems.first { $0.id == "docker-prune-build-cache" })
+        XCTAssertEqual(validBuildCacheItem.riskLevel, .safe)
+        XCTAssertEqual(validBuildCacheItem.reclaimableSize, 180_000_000)
+        XCTAssertTrue(validBuildCacheItem.canBeSelected)
+        XCTAssertTrue(CleanerViewModel.isEligibleForRecommendedSafeCleanup(validBuildCacheItem))
+
+        // 2. Malformed / unsupported `docker builder du` output -> REVIEW + 0 reclaimable + non-selectable
+        for malformedOutput in [
+            "{\"unexpected\":\"json_without_id_or_size\"}",
+            "{\"ID\":\"b1\",\"Reclaimable\":true,\"Size\":\"not_a_size\"}",
+            "ID RECLAIMABLE SIZE\ncache1 maybe unknown_size",
+            "UNSUPPORTED BUILDER DU FORMAT 500MB"
+        ] {
+            XCTAssertNil(DockerCleaner.parseDockerBuilderDUOutput(malformedOutput), "Malformed builder du output must return nil: \(malformedOutput)")
+            let malformedStats = DockerCleaner.parseDockerSystemDFJSONLines(
+                dfOutputWith500MBBuildCache,
+                danglingImagesOutput: danglingOutput,
+                builderDUOutput: malformedOutput
+            )
+            XCTAssertFalse(malformedStats.buildCacheVerified)
+            XCTAssertEqual(malformedStats.buildCacheReclaimableBytes, 0, "Must never fall back to 500MB from docker system df")
+
+            let malformedItems = await DockerCleaner(
+                homeDirectory: tempHome.path,
+                daemonRunningOverride: true,
+                diskUsageOverride: mockDisk,
+                cliStatsOverride: malformedStats
+            ).scan(snapshot: .empty, ageFilter: .all)
+            let buildCacheItem = try XCTUnwrap(malformedItems.first { $0.id == "docker-prune-build-cache" })
+            XCTAssertEqual(buildCacheItem.riskLevel, .review)
+            XCTAssertEqual(buildCacheItem.reclaimableSize, 0)
+            XCTAssertFalse(buildCacheItem.canBeSelected)
+            XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(buildCacheItem))
+            XCTAssertTrue(buildCacheItem.explanation.contains("could not be verified"))
+        }
+
+        // 3. `docker builder du` command failure -> REVIEW + 0 reclaimable + non-selectable
+        let commandFailureStats = await DockerCleaner.fetchLiveDockerCLIStats(
+            dockerBinary: "/mock/bin/docker",
+            runner: { _, args in
+                if args.prefix(2) == ["system", "df"] {
+                    return ShellResult(exitCode: 0, stdout: dfOutputWith500MBBuildCache, stderr: "")
+                }
+                if args.prefix(2) == ["image", "ls"] && args.contains("dangling=true") {
+                    return ShellResult(exitCode: 0, stdout: danglingOutput, stderr: "")
+                }
+                if args.prefix(2) == ["builder", "du"] {
+                    return ShellResult(exitCode: 1, stdout: "", stderr: "failed to query buildkit du")
+                }
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            }
+        )
+        XCTAssertFalse(commandFailureStats.buildCacheVerified)
+        XCTAssertEqual(commandFailureStats.buildCacheReclaimableBytes, 0)
+        XCTAssertEqual(commandFailureStats.buildCacheSizeBytes, 500_000_000)
+
+        let failureItems = await DockerCleaner(
+            homeDirectory: tempHome.path,
+            daemonRunningOverride: true,
+            diskUsageOverride: mockDisk,
+            cliStatsOverride: commandFailureStats
+        ).scan(snapshot: .empty, ageFilter: .all)
+        let failedBuildCacheItem = try XCTUnwrap(failureItems.first { $0.id == "docker-prune-build-cache" })
+        XCTAssertEqual(failedBuildCacheItem.riskLevel, .review)
+        XCTAssertEqual(failedBuildCacheItem.reclaimableSize, 0)
+        XCTAssertFalse(failedBuildCacheItem.canBeSelected)
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(failedBuildCacheItem))
+        XCTAssertTrue(failedBuildCacheItem.explanation.contains("could not be verified"))
+
+        // 4. `docker system df` showing reclaimable bytes must NOT promote build cache to SAFE when builder data is unverified
+        let unverifiedDFStats = DockerCleaner.parseDockerSystemDFJSONLines(dfOutputWith500MBBuildCache, danglingImagesOutput: danglingOutput, builderDUOutput: nil)
+        let unverifiedItems = await DockerCleaner(
+            homeDirectory: tempHome.path,
+            daemonRunningOverride: true,
+            diskUsageOverride: mockDisk,
+            cliStatsOverride: unverifiedDFStats
+        ).scan(snapshot: .empty, ageFilter: .all)
+        let unverifiedBuildCacheItem = try XCTUnwrap(unverifiedItems.first { $0.id == "docker-prune-build-cache" })
+        XCTAssertEqual(unverifiedBuildCacheItem.riskLevel, .review)
+        XCTAssertEqual(unverifiedBuildCacheItem.reclaimableSize, 0)
+        XCTAssertFalse(unverifiedBuildCacheItem.canBeSelected)
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(unverifiedBuildCacheItem))
     }
 
     // MARK: - 5. Simulator Model, Last Used & 30-Day Recommendation Threshold Tests
