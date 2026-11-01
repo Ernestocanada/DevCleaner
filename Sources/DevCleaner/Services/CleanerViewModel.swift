@@ -408,15 +408,30 @@ public final class CleanerViewModel: ObservableObject {
         guard item.riskLevel == .safe && item.canBeSelected && item.reclaimableSize > 0 else {
             return false
         }
-        // Explicitly exclude simulators, Docker volumes, VM bundles, Codex runtimes, node_modules, and worktrees
+        // Explicitly exclude simulators, Android AVDs, Docker volumes/unused non-dangling images, VM bundles, Codex runtimes, node_modules, and worktrees
         if item.category == .iosSimulators || item.simulatorMetadata != nil || item.id.hasPrefix("sim-") {
             return false
         }
-        if item.id == "docker-prune-volumes" || item.id == "claude-vm-bundles" || item.id == "codex-runtimes-cache" {
+        if case .avdManagerDelete = item.actionType {
+            return false
+        }
+        if item.id.hasPrefix("android-avd-") {
+            return false
+        }
+        if item.id == "docker-prune-volumes" ||
+            item.id == "docker-prune-unused-images" ||
+            item.id == "claude-vm-bundles" ||
+            item.id == "codex-runtimes-cache" ||
+            item.id == "openai-atlas-unverified-review" ||
+            item.id == "google-caches-unverified-review" {
             return false
         }
         let lowerPath = item.path.lowercased()
-        if lowerPath.hasSuffix("/node_modules") || lowerPath.contains("/node_modules/") || lowerPath.contains("/.claude/worktrees") {
+        if lowerPath.hasSuffix("/library/caches/com.openai.atlas") ||
+            lowerPath.hasSuffix("/library/caches/google") ||
+            lowerPath.hasSuffix("/node_modules") ||
+            lowerPath.contains("/node_modules/") ||
+            lowerPath.contains("/.claude/worktrees") {
             return false
         }
         return true

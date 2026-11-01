@@ -63,6 +63,7 @@ public enum CleanupActionType: Codable, Equatable, Sendable {
     case simctlDeleteDevice(udid: String)
     case simctlDeleteUnavailable
     case simctlDeleteRuntime(identifier: String)
+    case avdManagerDelete(avdName: String, avdPath: String)
     case dockerPrune(subcommand: [String])
     case readOnlyInfo(reason: String)
 }
@@ -70,6 +71,7 @@ public enum CleanupActionType: Codable, Equatable, Sendable {
 public enum CleanupResultAction: String, Codable, Equatable, Sendable {
     case moveToTrash = "Move to Trash"
     case simctlDelete = "simctl delete"
+    case avdManagerDelete = "avdmanager delete"
     case dockerPrune = "Docker prune"
     case none = "None"
 }
@@ -283,14 +285,21 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
         return state.uppercased()
     }
 
+    public static let keepThresholdDays: Int = 30
+    public static let keepThresholdSeconds: TimeInterval = TimeInterval(keepThresholdDays * 86400)
+
     public var recommendationBadgeText: String {
+        recommendationBadge(referenceDate: Date())
+    }
+
+    public func recommendationBadge(referenceDate: Date = Date()) -> String {
         if !isAvailable {
             return "UNAVAILABLE"
         }
         if isBooted || isFavorite {
             return "KEEP"
         }
-        if let lastUsedAt, Date().timeIntervalSince(lastUsedAt) <= 14 * 86400 {
+        if let lastUsedAt, referenceDate.timeIntervalSince(lastUsedAt) <= Self.keepThresholdSeconds + 5 {
             return "KEEP"
         }
         return "REVIEW"
@@ -397,6 +406,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
             return .moveToTrash
         case .simctlDeleteDevice, .simctlDeleteUnavailable, .simctlDeleteRuntime:
             return .simctlDelete
+        case .avdManagerDelete:
+            return .avdManagerDelete
         case .dockerPrune:
             return .dockerPrune
         case .readOnlyInfo:
@@ -421,6 +432,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
             return "xcrun simctl delete unavailable"
         case .simctlDeleteRuntime(let id):
             return "xcrun simctl runtime delete \(id)"
+        case .avdManagerDelete(let avdName, _):
+            return "avdmanager delete avd -n \(avdName)"
         case .dockerPrune(let args):
             return "docker \(args.joined(separator: " "))"
         case .readOnlyInfo:

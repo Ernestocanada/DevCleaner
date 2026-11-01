@@ -187,6 +187,10 @@ public struct AndroidCleaner: CleanerProvider {
                     .joined(separator: " • ")
                 let metaPrefix = metaSummary.isEmpty ? "" : "[\(metaSummary)] "
 
+                let avdAction: CleanupActionType = Self.isValidAVDName(avdName)
+                    ? .avdManagerDelete(avdName: avdName, avdPath: entry.path)
+                    : .readOnlyInfo(reason: "AVD name contains invalid characters for official avdmanager CLI deletion.")
+
                 items.append(
                     CleanableItem(
                         id: "android-avd-\(avdName)",
@@ -195,15 +199,15 @@ public struct AndroidCleaner: CleanerProvider {
                         path: entry.path,
                         logicalSize: usage.logicalSize,
                         physicalSize: usage.physicalSize,
-                        reclaimableSize: active ? 0 : usage.physicalSize,
+                        reclaimableSize: active || !Self.isValidAVDName(avdName) ? 0 : usage.physicalSize,
                         lastModified: usage.lastModified,
                         riskLevel: .review,
-                        explanation: "\(metaPrefix)Android Virtual Device disk image, userdata, and snapshots (\(avdName).avd). Review before deleting or manage via `avdmanager delete avd -n \(avdName)`.",
-                        deletionConsequence: "Moves \(avdName).avd to macOS Trash. Never allowed while emulator/qemu is running.",
+                        explanation: "\(metaPrefix)Android Virtual Device disk image, userdata, and snapshots (\(avdName).avd). Review before deleting via `avdmanager delete avd -n \(avdName)`.",
+                        deletionConsequence: "Deletes this AVD and its .ini metadata via official 'avdmanager delete avd -n \(avdName)'. Never deletes .avd folders manually; blocked while emulator/qemu is running.",
                         regenerationImpact: "Requires recreating the virtual device in Android Studio Device Manager and re-installing test apps.",
                         isRunningDependency: active,
                         runningProcessNames: activeNames,
-                        actionType: .moveToTrash(path: entry.path)
+                        actionType: avdAction
                     )
                 )
             }
@@ -247,6 +251,53 @@ public struct AndroidCleaner: CleanerProvider {
         }
 
         return items
+    }
+
+    public static func isValidAVDName(_ name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed == name, trimmed.count <= 128 else {
+            return false
+        }
+        guard !name.contains(".."), !name.contains("/"), !name.contains("\\"), !name.hasPrefix("-") else {
+            return false
+        }
+        return name.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*$"#, options: .regularExpression) != nil
+    }
+
+    public static func resolveAVDManagerBinary(
+        homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        customCandidates: [String]? = nil
+    ) -> String? {
+        let fm = FileManager.default
+        if let customCandidates {
+            return customCandidates.first { candidate in
+                !candidate.contains("..") && fm.isExecutableFile(atPath: candidate)
+            }
+        }
+
+        let sdkPath = "\(homeDirectory)/Library/Android/sdk"
+        var candidates: [String] = [
+            "\(sdkPath)/cmdline-tools/latest/bin/avdmanager"
+        ]
+
+        let cmdlineToolsRoot = "\(sdkPath)/cmdline-tools"
+        if let toolVersions = try? fm.contentsOfDirectory(atPath: cmdlineToolsRoot) {
+            for version in toolVersions.sorted().reversed() where version != "latest" && !version.hasPrefix(".") {
+                candidates.append("\(cmdlineToolsRoot)/\(version)/bin/avdmanager")
+            }
+        }
+
+        candidates.append(contentsOf: [
+            "\(sdkPath)/tools/bin/avdmanager",
+            "/opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin/avdmanager",
+            "/usr/local/share/android-commandlinetools/cmdline-tools/latest/bin/avdmanager",
+            "/opt/homebrew/bin/avdmanager",
+            "/usr/local/bin/avdmanager"
+        ])
+
+        return candidates.first { candidate in
+            !candidate.contains("..") && fm.isExecutableFile(atPath: candidate)
+        }
     }
 
     public static func activeLockPID(inAVDDirectory avdURL: URL) -> Int32? {

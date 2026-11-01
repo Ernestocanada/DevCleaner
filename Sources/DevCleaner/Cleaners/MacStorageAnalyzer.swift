@@ -364,8 +364,11 @@ public struct MacStorageAnalyzer: Sendable {
         case .nodeNpm, .gradle, .cocoapodsSwiftPM, .homebrew:
             return .packageManagers
         case .generalCaches:
+            if item.id.hasPrefix("openai-atlas-") {
+                return .aiTools
+            }
             switch item.id {
-            case "openai-atlas-cache", "openai-chat-cache", "gemini-macos-cache", "antigravity-cache", "antigravity-updater-cache":
+            case "openai-chat-cache", "gemini-macos-cache", "antigravity-cache", "antigravity-updater-cache":
                 return .aiTools
             case "pip-cache":
                 return .packageManagers

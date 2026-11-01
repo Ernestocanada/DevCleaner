@@ -35,6 +35,7 @@ public struct CleanupExecutor: Sendable {
     public let processChecker: @Sendable (CleanerCategory) async -> [String]
     public let trashHandler: @Sendable (URL) throws -> Void
     public let shellRunner: @Sendable (String, [String]) async -> ShellResult
+    public let avdManagerResolver: @Sendable () -> String?
 
     public init(
         validator: SafetyValidator = SafetyValidator(),
@@ -48,13 +49,17 @@ public struct CleanupExecutor: Sendable {
         },
         shellRunner: @escaping @Sendable (String, [String]) async -> ShellResult = { executable, arguments in
             await ShellRunner.shared.run(executable, arguments: arguments)
-        }
+        },
+        avdManagerResolver: (@Sendable () -> String?)? = nil
     ) {
         self.validator = validator
         self.freeSpaceProvider = freeSpaceProvider
         self.processChecker = processChecker
         self.trashHandler = trashHandler
         self.shellRunner = shellRunner
+        self.avdManagerResolver = avdManagerResolver ?? {
+            AndroidCleaner.resolveAVDManagerBinary(homeDirectory: validator.homeDirectory)
+        }
     }
 
     public func execute(_ item: CleanableItem, ageFilter: AgeFilter = .all) async throws -> CleanupResult {
@@ -365,6 +370,40 @@ public struct CleanupExecutor: Sendable {
                 action: .simctlDelete,
                 status: .cleaned,
                 message: "Deleted simulator runtime \(identifier) via simctl."
+            )
+
+        case .avdManagerDelete(let avdName, let avdPath):
+            guard AndroidCleaner.isValidAVDName(avdName) else {
+                throw CleanerError.commandFailed("Invalid or unsafe Android AVD name: \(avdName)")
+            }
+            let expandedAVDPath = (avdPath as NSString).expandingTildeInPath
+            if !expandedAVDPath.isEmpty {
+                let avdURL = URL(fileURLWithPath: expandedAVDPath)
+                if let pid = AndroidCleaner.activeLockPID(inAVDDirectory: avdURL) {
+                    throw CleanerError.runningProcessActive(
+                        appName: "Android emulator (PID \(pid))",
+                        categoryName: item.category.rawValue
+                    )
+                }
+            }
+            guard let avdManagerBin = avdManagerResolver(), !avdManagerBin.isEmpty else {
+                throw CleanerError.commandFailed(
+                    "Cleanup blocked: Official 'avdmanager' tool was not found in the Android SDK. DevCleaner never deletes .avd directories manually."
+                )
+            }
+            let res = await shellRunner(avdManagerBin, ["delete", "avd", "-n", avdName])
+            if !res.isSuccess {
+                throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
+            }
+            let freeAfter = freeSpaceProvider()
+            let freedDelta = max(0, freeAfter - freeBefore)
+            return CleanupResult(
+                processedBytes: item.reclaimableSize,
+                movedToTrashBytes: 0,
+                actuallyFreedBytes: freedDelta,
+                action: .avdManagerDelete,
+                status: .cleaned,
+                message: "Deleted Android AVD '\(avdName)' via official avdmanager."
             )
 
         case .dockerPrune(let subcommand):

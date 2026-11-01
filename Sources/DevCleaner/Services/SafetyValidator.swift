@@ -103,6 +103,7 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Android/sdk/platforms",
             "\(homeDirectory)/Library/Android/sdk/build-tools",
             "\(homeDirectory)/Library/Android/sdk/emulator",
+            "\(homeDirectory)/.android/avd",
             "\(homeDirectory)/Library/Containers/com.docker.docker",
             "\(homeDirectory)/Library/Application Support/Claude/local-agent-mode-sessions",
             "\(homeDirectory)/Library/Application Support/Claude/claude-code-sessions",
@@ -144,13 +145,22 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Caches/CocoaPods",
             "\(homeDirectory)/Library/Caches/Homebrew",
             "\(homeDirectory)/Library/Caches/Codex",
-            "\(homeDirectory)/Library/Caches/Google",
+            "\(homeDirectory)/Library/Caches/Google/Cache",
+            "\(homeDirectory)/Library/Caches/Google/Code Cache",
+            "\(homeDirectory)/Library/Caches/Google/GPUCache",
             "\(homeDirectory)/Library/Caches/pip",
             "\(homeDirectory)/Library/Caches/Yarn",
             "\(homeDirectory)/Library/Caches/pnpm",
             "\(homeDirectory)/Library/Caches/ms-playwright",
             "\(homeDirectory)/Library/Caches/ms-playwright-go",
-            "\(homeDirectory)/Library/Caches/com.openai.atlas",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/Cache",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/Code Cache",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/GPUCache",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/fsCachedData",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/com.onevcat.Kingfisher.ImageCache",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/browser-data/Cache",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/browser-data/Code Cache",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/browser-data/GPUCache",
             "\(homeDirectory)/Library/Caches/dotslash",
             "\(homeDirectory)/Library/Caches/com.google.antigravity",
             "\(homeDirectory)/Library/Caches/com.google.GeminiMacOS",
@@ -173,7 +183,6 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/.cache/node/corepack",
             "\(homeDirectory)/.cache/pkg",
             "\(homeDirectory)/.cache/mesa_shader_cache",
-            "\(homeDirectory)/.android/avd",
             "\(homeDirectory)/.android/cache",
             "\(homeDirectory)/Library/Android/sdk/.temp",
             "\(homeDirectory)/Library/Application Support/Claude/Cache",
@@ -396,7 +405,7 @@ public struct SafetyValidator: Sendable {
             throw SafetyError.notInExplicitAllowList(normalized)
         }
 
-        // 5. Explicitly block manual deletion of whole Application Support app roots
+        // 5. Explicitly block manual deletion of whole Application Support app roots and broad cache containers
         let protectedAppSupportRoots: Set<String> = [
             "\(homeDirectory)/Library/Application Support/Claude",
             "\(homeDirectory)/Library/Application Support/Codex",
@@ -406,20 +415,27 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Application Support/Notion",
             "\(homeDirectory)/Library/Application Support/Google",
             "\(homeDirectory)/Library/Application Support/OutSystems",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/browser-data",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas/browser-data/host",
+            "\(homeDirectory)/Library/Caches/Google",
+            "\(homeDirectory)/Library/Caches/Google/Chrome",
             "\(homeDirectory)/.cache/firebase"
         ]
         if protectedAppSupportRoots.contains(normalized) {
             throw SafetyError.forbiddenProtectedPath(normalized)
         }
 
-        // 6. Check explicit allow-list (or verified .litertlm model file in ~/Library/Caches)
+        // 6. Check explicit allow-list, verified dynamic subcaches (Atlas/Google), or verified .litertlm model file in ~/Library/Caches
         let isLitertlmInCaches: Bool = {
             let parent = URL(fileURLWithPath: normalized).deletingLastPathComponent().path
             return parent == "\(homeDirectory)/Library/Caches" && normalized.lowercased().hasSuffix(".litertlm")
         }()
-        let isAllowed = isLitertlmInCaches || allowedRootPrefixes.contains { allowed in
-            normalized == allowed || normalized.hasPrefix(allowed + "/")
-        }
+        let isAllowed = isLitertlmInCaches
+            || isAllowedVerifiedSubcachePath(normalized)
+            || allowedRootPrefixes.contains { allowed in
+                normalized == allowed || normalized.hasPrefix(allowed + "/")
+            }
         guard isAllowed else {
             throw SafetyError.notInExplicitAllowList(normalized)
         }
@@ -429,7 +445,7 @@ public struct SafetyValidator: Sendable {
             let url = URL(fileURLWithPath: normalized)
             let resolved = url.resolvingSymlinksInPath().path
             if resolved != normalized {
-                let resolvedAllowed = allowedRootPrefixes.contains { allowed in
+                let resolvedAllowed = isAllowedVerifiedSubcachePath(resolved) || allowedRootPrefixes.contains { allowed in
                     let resolvedAllowedPrefix = URL(fileURLWithPath: allowed).resolvingSymlinksInPath().path
                     return resolved == resolvedAllowedPrefix || resolved.hasPrefix(resolvedAllowedPrefix + "/")
                 }
@@ -440,6 +456,48 @@ public struct SafetyValidator: Sendable {
         }
 
         return normalized
+    }
+
+    /// Matches verified regenerable dynamic subcaches inside com.openai.atlas/browser-data/host/* and Google/Chrome/*
+    public func isAllowedVerifiedSubcachePath(_ normalizedPath: String) -> Bool {
+        let resolvedHome = URL(fileURLWithPath: homeDirectory).resolvingSymlinksInPath().path
+        let homeCandidates = Set([homeDirectory, resolvedHome])
+
+        let allowedAtlasHostSubcaches: Set<String> = ["Cache", "Code Cache", "GPUCache"]
+        let allowedGoogleChromeSubcaches: Set<String> = ["Cache", "Code Cache", "GPUCache", "image_cache"]
+
+        for baseHome in homeCandidates {
+            let atlasHostPrefix = "\(baseHome)/Library/Caches/com.openai.atlas/browser-data/host/"
+            if normalizedPath.hasPrefix(atlasHostPrefix) {
+                let remainder = String(normalizedPath.dropFirst(atlasHostPrefix.count))
+                let parts = remainder.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+                if parts.count >= 2 {
+                    let hostSegment = parts[0]
+                    let subcacheSegment = parts[1]
+                    if !hostSegment.isEmpty && hostSegment != "." && hostSegment != ".." &&
+                        allowedAtlasHostSubcaches.contains(subcacheSegment) &&
+                        !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) {
+                        return true
+                    }
+                }
+            }
+
+            let googleChromePrefix = "\(baseHome)/Library/Caches/Google/Chrome/"
+            if normalizedPath.hasPrefix(googleChromePrefix) {
+                let remainder = String(normalizedPath.dropFirst(googleChromePrefix.count))
+                let parts = remainder.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+                if parts.count >= 2 {
+                    let profileSegment = parts[0]
+                    let subcacheSegment = parts[1]
+                    if !profileSegment.isEmpty && profileSegment != "." && profileSegment != ".." &&
+                        allowedGoogleChromeSubcaches.contains(subcacheSegment) &&
+                        !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 
     public func validateNotModifiedSinceScan(_ validatedPath: String, expectedModifiedAt: Date?) throws {
@@ -517,7 +575,7 @@ public struct SafetyValidator: Sendable {
             }
             if let vals = try? childURL.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
                 let resolved = childURL.resolvingSymlinksInPath().path
-                let resolvedAllowed = resolvedAllowedPrefixes.contains { resolvedAllowedPrefix in
+                let resolvedAllowed = isAllowedVerifiedSubcachePath(resolved) || resolvedAllowedPrefixes.contains { resolvedAllowedPrefix in
                     resolved == resolvedAllowedPrefix || resolved.hasPrefix(resolvedAllowedPrefix + "/")
                 }
                 if !resolvedAllowed {

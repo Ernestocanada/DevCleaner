@@ -5,6 +5,12 @@ public struct DockerCLIStats: Sendable, Equatable {
     public var imagesActiveCount: Int
     public var imagesSizeBytes: Int64
     public var imagesReclaimableBytes: Int64
+    public var danglingImagesCount: Int
+    public var danglingImagesReclaimableBytes: Int64
+
+    public var unusedNonDanglingImagesReclaimableBytes: Int64 {
+        max(0, imagesReclaimableBytes - danglingImagesReclaimableBytes)
+    }
 
     public var containersTotalCount: Int
     public var containersRunningCount: Int
@@ -27,6 +33,8 @@ public struct DockerCLIStats: Sendable, Equatable {
         imagesActiveCount: 0,
         imagesSizeBytes: 0,
         imagesReclaimableBytes: 0,
+        danglingImagesCount: 0,
+        danglingImagesReclaimableBytes: 0,
         containersTotalCount: 0,
         containersRunningCount: 0,
         containersStoppedCount: 0,
@@ -47,6 +55,8 @@ public struct DockerCLIStats: Sendable, Equatable {
         imagesActiveCount: Int,
         imagesSizeBytes: Int64,
         imagesReclaimableBytes: Int64,
+        danglingImagesCount: Int = 0,
+        danglingImagesReclaimableBytes: Int64 = 0,
         containersTotalCount: Int,
         containersRunningCount: Int,
         containersStoppedCount: Int,
@@ -65,6 +75,8 @@ public struct DockerCLIStats: Sendable, Equatable {
         self.imagesActiveCount = imagesActiveCount
         self.imagesSizeBytes = imagesSizeBytes
         self.imagesReclaimableBytes = imagesReclaimableBytes
+        self.danglingImagesCount = danglingImagesCount
+        self.danglingImagesReclaimableBytes = danglingImagesReclaimableBytes
         self.containersTotalCount = containersTotalCount
         self.containersRunningCount = containersRunningCount
         self.containersStoppedCount = containersStoppedCount
@@ -148,8 +160,8 @@ public struct DockerCleaner: CleanerProvider {
 
         let statusDesc: String
         if daemonRunning, let stats {
-            let totalReclaimable = stats.imagesReclaimableBytes + stats.containersReclaimableBytes + stats.buildCacheReclaimableBytes
-            statusDesc = "Docker Desktop is running (Images: \(stats.imagesTotalCount), Containers: \(stats.containersRunningCount) running / \(stats.containersStoppedCount) stopped, Volumes: \(stats.volumesTotalCount), Reclaimable SAFE: \(Formatters.bytes(totalReclaimable)))."
+            let safeReclaimable = stats.danglingImagesReclaimableBytes + stats.containersReclaimableBytes + stats.buildCacheReclaimableBytes
+            statusDesc = "Docker Desktop is running (Images: \(stats.imagesTotalCount) [\(stats.danglingImagesCount) dangling], Containers: \(stats.containersRunningCount) running / \(stats.containersStoppedCount) stopped, Volumes: \(stats.volumesTotalCount), Reclaimable SAFE: \(Formatters.bytes(safeReclaimable)))."
         } else if daemonRunning {
             statusDesc = "Docker Desktop is running."
         } else {
@@ -179,7 +191,7 @@ public struct DockerCleaner: CleanerProvider {
         let buildCacheReclaimable = stats?.buildCacheReclaimableBytes ?? 0
         let buildCacheTotal = stats?.buildCacheSizeBytes ?? 0
         let buildCacheDetail = stats != nil
-            ? " (Total: \(Formatters.bytes(buildCacheTotal)) • Reclaimable: \(Formatters.bytes(buildCacheReclaimable)))"
+            ? " (Total: \(Formatters.bytes(buildCacheTotal)) • Reclaimable by prune: \(Formatters.bytes(buildCacheReclaimable)))"
             : ""
 
         let containersReclaimable = stats?.containersReclaimableBytes ?? 0
@@ -187,10 +199,17 @@ public struct DockerCleaner: CleanerProvider {
             ? " (\(stats!.containersStoppedCount) stopped / \(stats!.containersRunningCount) running • Reclaimable: \(Formatters.bytes(containersReclaimable)))"
             : ""
 
-        let imagesReclaimable = stats?.imagesReclaimableBytes ?? 0
+        let danglingImagesCount = stats?.danglingImagesCount ?? 0
+        let danglingImagesReclaimable = stats?.danglingImagesReclaimableBytes ?? 0
+        let danglingImagesDetail = stats != nil
+            ? " (\(danglingImagesCount) dangling images • Reclaimable: \(Formatters.bytes(danglingImagesReclaimable)))"
+            : ""
+
+        let unusedNonDanglingReclaimable = stats?.unusedNonDanglingImagesReclaimableBytes ?? 0
+        let totalUnusedImagesReclaimable = stats?.imagesReclaimableBytes ?? 0
         let imagesTotal = stats?.imagesSizeBytes ?? 0
-        let imagesDetail = stats != nil
-            ? " (\(stats!.imagesTotalCount) images, \(Formatters.bytes(imagesTotal)) total • Reclaimable: \(Formatters.bytes(imagesReclaimable)))"
+        let unusedImagesDetail = stats != nil
+            ? " (\(stats!.imagesTotalCount) images, \(Formatters.bytes(imagesTotal)) total • Unused beyond dangling: \(Formatters.bytes(unusedNonDanglingReclaimable)) • Total unused with -a: \(Formatters.bytes(totalUnusedImagesReclaimable)))"
             : ""
 
         let volumesReclaimable = stats?.volumesReclaimableBytes ?? 0
@@ -199,14 +218,15 @@ public struct DockerCleaner: CleanerProvider {
             ? " (\(stats!.volumesTotalCount) volumes, \(Formatters.bytes(volumesTotal)) total • Reclaimable: \(Formatters.bytes(volumesReclaimable)))"
             : ""
 
-        let pruneSpecs: [(id: String, name: String, args: [String], risk: RiskLevel, reclaimable: Int64, desc: String)] = [
+        let pruneSpecs: [(id: String, name: String, args: [String], risk: RiskLevel, reclaimable: Int64, desc: String, requiresRedownload: Bool)] = [
             (
                 "docker-prune-build-cache",
                 "Docker Build Cache (docker builder prune -f)\(buildCacheDetail)",
                 ["builder", "prune", "-f"],
                 (daemonRunning && buildCacheReclaimable > 0) ? .safe : .review,
                 daemonRunning ? buildCacheReclaimable : 0,
-                "Removes dangling BuildKit cache layers via official Docker CLI (`docker builder du` / `docker system df`).\(buildCacheDetail)"
+                "Removes only non-in-use, unshared BuildKit cache layers that `docker builder prune -f` actually removes.\(buildCacheDetail)",
+                false
             ),
             (
                 "docker-prune-stopped-containers",
@@ -214,15 +234,26 @@ public struct DockerCleaner: CleanerProvider {
                 ["container", "prune", "-f"],
                 (daemonRunning && containersReclaimable > 0) ? .safe : .review,
                 daemonRunning ? containersReclaimable : 0,
-                "Removes stopped containers via official Docker CLI (`docker container ls -a`).\(containersDetail)"
+                "Removes stopped containers via official Docker CLI (`docker container ls -a`).\(containersDetail)",
+                false
             ),
             (
                 "docker-prune-dangling-images",
-                "Docker Dangling / Unused Images (docker image prune -f)\(imagesDetail)",
+                "Docker Dangling Images (docker image prune -f)\(danglingImagesDetail)",
                 ["image", "prune", "-f"],
-                (daemonRunning && imagesReclaimable > 0) ? .safe : .review,
-                daemonRunning ? imagesReclaimable : 0,
-                "Removes dangling container images via official Docker CLI (`docker image ls`).\(imagesDetail)"
+                (daemonRunning && danglingImagesReclaimable > 0) ? .safe : .review,
+                daemonRunning ? danglingImagesReclaimable : 0,
+                "SAFE: Removes only untagged/dangling container images (`docker image ls -f dangling=true`). Tagged unused images are preserved.\(danglingImagesDetail)",
+                false
+            ),
+            (
+                "docker-prune-unused-images",
+                "Docker Unused Non-Dangling Images (docker image prune -a -f)\(unusedImagesDetail)",
+                ["image", "prune", "-a", "-f"],
+                .review, // Always REVIEW: removes tagged images not currently used by any container
+                daemonRunning ? unusedNonDanglingReclaimable : 0,
+                "REVIEW: Removes unused container images beyond dangling ones (`docker image prune -a -f`). Re-pulling base images will require a network download.\(unusedImagesDetail)",
+                true
             ),
             (
                 "docker-prune-volumes",
@@ -230,7 +261,8 @@ public struct DockerCleaner: CleanerProvider {
                 ["volume", "prune", "-f"],
                 .caution, // Volumes are ALWAYS CAUTION, never SAFE automatically
                 daemonRunning ? volumesReclaimable : 0,
-                "CAUTION: Permanently removes unused local Docker volumes (`docker volume ls`). May contain database or persistent container data.\(volumesDetail)"
+                "CAUTION: Permanently removes unused local Docker volumes (`docker volume ls`). May contain database or persistent container data.\(volumesDetail)",
+                false
             )
         ]
 
@@ -253,7 +285,8 @@ public struct DockerCleaner: CleanerProvider {
                     runningProcessNames: [],
                     actionType: daemonRunning
                         ? .dockerPrune(subcommand: spec.args)
-                        : .readOnlyInfo(reason: "Docker Desktop is not running. Start Docker to use CLI cleanup.")
+                        : .readOnlyInfo(reason: "Docker Desktop is not running. Start Docker to use CLI cleanup."),
+                    requiresRedownload: spec.requiresRedownload
                 )
             )
         }
@@ -263,13 +296,26 @@ public struct DockerCleaner: CleanerProvider {
 
     public static func fetchLiveDockerCLIStats(dockerBinary: String) async -> DockerCLIStats {
         async let dfRes = ShellRunner.shared.run(dockerBinary, arguments: ["system", "df", "--format", "{{json .}}"], timeoutSeconds: 8)
+        async let danglingRes = ShellRunner.shared.run(dockerBinary, arguments: ["image", "ls", "-f", "dangling=true", "--format", "{{.ID}}\t{{.Size}}"], timeoutSeconds: 5)
         async let psRes = ShellRunner.shared.run(dockerBinary, arguments: ["container", "ls", "-a", "--format", "{{.State}}"], timeoutSeconds: 5)
         async let imgRes = ShellRunner.shared.run(dockerBinary, arguments: ["image", "ls", "-q"], timeoutSeconds: 5)
         async let volRes = ShellRunner.shared.run(dockerBinary, arguments: ["volume", "ls", "-q"], timeoutSeconds: 5)
-        async let builderRes = ShellRunner.shared.run(dockerBinary, arguments: ["builder", "du"], timeoutSeconds: 5)
+        async let builderJSONRes = ShellRunner.shared.run(dockerBinary, arguments: ["builder", "du", "--format", "{{json .}}"], timeoutSeconds: 5)
 
-        let (df, ps, img, vol, _) = await (dfRes, psRes, imgRes, volRes, builderRes)
-        var stats = parseDockerSystemDFJSONLines(df.stdout)
+        let (df, dangling, ps, img, vol, builderJSON) = await (dfRes, danglingRes, psRes, imgRes, volRes, builderJSONRes)
+        let builderOutput: String?
+        if builderJSON.isSuccess && !builderJSON.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            builderOutput = builderJSON.stdout
+        } else {
+            let builderTable = await ShellRunner.shared.run(dockerBinary, arguments: ["builder", "du"], timeoutSeconds: 5)
+            builderOutput = builderTable.isSuccess ? builderTable.stdout : nil
+        }
+
+        var stats = parseDockerSystemDFJSONLines(
+            df.stdout,
+            danglingImagesOutput: dangling.isSuccess ? dangling.stdout : nil,
+            builderDUOutput: builderOutput
+        )
 
         if ps.isSuccess {
             let states = ps.stdout.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty }
@@ -296,7 +342,11 @@ public struct DockerCleaner: CleanerProvider {
         return stats
     }
 
-    public static func parseDockerSystemDFJSONLines(_ output: String) -> DockerCLIStats {
+    public static func parseDockerSystemDFJSONLines(
+        _ output: String,
+        danglingImagesOutput: String? = nil,
+        builderDUOutput: String? = nil
+    ) -> DockerCLIStats {
         var stats = DockerCLIStats.zero
         for rawLine in output.split(separator: "\n") {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -314,6 +364,8 @@ public struct DockerCleaner: CleanerProvider {
                 stats.imagesTotalCount = totalCount
                 stats.imagesActiveCount = activeCount
                 stats.imagesSizeBytes = sizeBytes
+                // Note: docker system df "Images" Reclaimable includes all unused images (dangling + tagged unused).
+                // Dangling-only bytes for `docker image prune -f` come from `docker image ls -f dangling=true`.
                 stats.imagesReclaimableBytes = reclaimableBytes
             } else if typeName.contains("container") {
                 stats.containersTotalCount = totalCount
@@ -333,7 +385,122 @@ public struct DockerCleaner: CleanerProvider {
                 stats.buildCacheReclaimableBytes = reclaimableBytes
             }
         }
+
+        if let danglingImagesOutput {
+            let parsedDangling = parseDockerDanglingImagesOutput(danglingImagesOutput)
+            stats.danglingImagesCount = parsedDangling.count
+            if stats.imagesReclaimableBytes > 0 {
+                stats.danglingImagesReclaimableBytes = min(stats.imagesReclaimableBytes, parsedDangling.bytes)
+            } else {
+                stats.danglingImagesReclaimableBytes = parsedDangling.bytes
+                stats.imagesReclaimableBytes = max(stats.imagesReclaimableBytes, parsedDangling.bytes)
+            }
+        }
+
+        if let builderDUOutput, let builderPruneBytes = parseDockerBuilderDUOutput(builderDUOutput) {
+            if stats.buildCacheReclaimableBytes > 0 {
+                stats.buildCacheReclaimableBytes = min(stats.buildCacheReclaimableBytes, builderPruneBytes)
+            } else {
+                stats.buildCacheReclaimableBytes = builderPruneBytes
+            }
+        }
+
         return stats
+    }
+
+    /// Parses `docker image ls -f dangling=true --format "{{.ID}}\t{{.Size}}"` (or JSON lines) deduplicating by image ID.
+    public static func parseDockerDanglingImagesOutput(_ output: String) -> (count: Int, bytes: Int64) {
+        var seenIDs = Set<String>()
+        var totalBytes: Int64 = 0
+
+        for rawLine in output.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+
+            if line.hasPrefix("{"),
+               let data = line.data(using: .utf8),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let id = (dict["ID"] as? String ?? UUID().uuidString).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !seenIDs.contains(id) else { continue }
+                seenIDs.insert(id)
+                let sizeStr = dict["Size"] as? String ?? "0B"
+                totalBytes += parseDockerSizeString(sizeStr)
+                continue
+            }
+
+            let lower = line.lowercased()
+            if lower.hasPrefix("repository") || lower.hasPrefix("image id") {
+                continue
+            }
+
+            let tabParts = line.split(separator: "\t").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            if tabParts.count >= 2 {
+                let id = tabParts[0]
+                guard !id.isEmpty, !seenIDs.contains(id) else { continue }
+                seenIDs.insert(id)
+                totalBytes += parseDockerSizeString(tabParts[1])
+            } else {
+                let wsParts = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+                if wsParts.count >= 2 {
+                    let id = wsParts[0]
+                    let sizeCandidate = wsParts.last ?? "0B"
+                    guard !id.isEmpty, !seenIDs.contains(id) else { continue }
+                    seenIDs.insert(id)
+                    totalBytes += parseDockerSizeString(sizeCandidate)
+                }
+            }
+        }
+
+        return (seenIDs.count, totalBytes)
+    }
+
+    /// Parses `docker builder du` output (JSON lines or tabular) and returns only the bytes that `docker builder prune -f` will actually remove (Reclaimable == true, InUse == false, Shared == false).
+    public static func parseDockerBuilderDUOutput(_ output: String) -> Int64? {
+        let lines = output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+
+        var parsedAnyRecord = false
+        var reclaimableBytes: Int64 = 0
+
+        for line in lines {
+            if line.hasPrefix("{") {
+                guard let data = line.data(using: .utf8),
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continue
+                }
+                parsedAnyRecord = true
+                let inUse = (dict["InUse"] as? Bool) ?? ((String(describing: dict["InUse"] ?? "false")).lowercased() == "true")
+                let reclaimable = (dict["Reclaimable"] as? Bool) ?? ((String(describing: dict["Reclaimable"] ?? "true")).lowercased() == "true")
+                let shared = (dict["Shared"] as? Bool) ?? ((String(describing: dict["Shared"] ?? "false")).lowercased() == "true")
+                let sizeStr = (dict["Size"] as? String ?? "0B").replacingOccurrences(of: "*", with: "")
+                if reclaimable && !inUse && !shared {
+                    reclaimableBytes += parseDockerSizeString(sizeStr)
+                }
+                continue
+            }
+
+            let lower = line.lowercased()
+            if lower.hasPrefix("id ") || lower.hasPrefix("id\t") || lower.hasPrefix("reclaimable:") || lower.hasPrefix("total:") {
+                if lower.hasPrefix("id ") || lower.hasPrefix("id\t") || lower.hasPrefix("total:") {
+                    parsedAnyRecord = true
+                }
+                continue
+            }
+
+            let cols = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard cols.count >= 3 else { continue }
+            let reclaimableCol = cols[1].lowercased()
+            let sizeCol = cols[2]
+            if reclaimableCol == "true" || reclaimableCol == "false" || reclaimableCol == "true*" {
+                parsedAnyRecord = true
+                // Exclude "true*" or size ending with "*" (shared cache not removed by default prune)
+                if reclaimableCol == "true" && !sizeCol.hasSuffix("*") {
+                    reclaimableBytes += parseDockerSizeString(sizeCol)
+                }
+            }
+        }
+
+        return parsedAnyRecord ? reclaimableBytes : nil
     }
 
     public static func parseDockerSizeString(_ raw: String) -> Int64 {

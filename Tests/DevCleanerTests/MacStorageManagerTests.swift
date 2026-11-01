@@ -68,6 +68,8 @@ final class MacStorageManagerTests: XCTestCase {
             "~/Library/Android/sdk/ndk",
             "~/Library/Android/sdk/system-images",
             "~/Library/Android/sdk/platforms",
+            "~/.android/avd",
+            "~/.android/avd/medium_phone.avd",
             "~/Library/Containers/com.docker.docker",
             "~/.cache/firebase",
             "~/.cache/firebase/emulators/firebase-adminsdk-prod.json",
@@ -75,8 +77,20 @@ final class MacStorageManagerTests: XCTestCase {
             "~/.cache/firebase/emulators/GoogleService-Info.plist",
             "~/.cache/firebase/emulators/google-services.json",
             "~/.cache/firebase/emulators/application_default_credentials.json",
-            "~/Library/Caches/com.openai.atlas/App-release.apk",
-            "~/Library/Caches/com.openai.atlas/AppStoreBuild.ipa"
+            "~/Library/Caches/com.openai.atlas",
+            "~/Library/Caches/com.openai.atlas/browser-data",
+            "~/Library/Caches/com.openai.atlas/browser-data/host",
+            "~/Library/Caches/com.openai.atlas/browser-data/host/user-123",
+            "~/Library/Caches/com.openai.atlas/org.sparkle-project.Sparkle",
+            "~/Library/Caches/com.openai.atlas/com.apple.e5rt.e5bundlecache",
+            "~/Library/Caches/com.openai.atlas/io.sentry",
+            "~/Library/Caches/com.openai.atlas/Cache.db",
+            "~/Library/Caches/com.openai.atlas/Cache/App-release.apk",
+            "~/Library/Caches/com.openai.atlas/Cache/AppStoreBuild.ipa",
+            "~/Library/Caches/Google",
+            "~/Library/Caches/Google/Chrome",
+            "~/Library/Caches/Google/Chrome/Default",
+            "~/Library/Caches/Google/UnknownTool"
         ]
 
         for path in blockedPaths {
@@ -89,7 +103,20 @@ final class MacStorageManagerTests: XCTestCase {
 
         // Verify allow-listed subcaches ARE permitted
         let allowedSubcaches = [
-            "~/Library/Caches/com.openai.atlas",
+            "~/Library/Caches/com.openai.atlas/Cache",
+            "~/Library/Caches/com.openai.atlas/Code Cache",
+            "~/Library/Caches/com.openai.atlas/GPUCache",
+            "~/Library/Caches/com.openai.atlas/com.onevcat.Kingfisher.ImageCache",
+            "~/Library/Caches/com.openai.atlas/browser-data/host/login-staging-123/Cache",
+            "~/Library/Caches/com.openai.atlas/browser-data/host/login-staging-123/Code Cache",
+            "~/Library/Caches/com.openai.atlas/browser-data/host/user-abc/Cache",
+            "~/Library/Caches/com.openai.atlas/browser-data/host/user-abc/Code Cache",
+            "~/Library/Caches/Google/Cache",
+            "~/Library/Caches/Google/Chrome/Default/Cache",
+            "~/Library/Caches/Google/Chrome/Default/Code Cache",
+            "~/Library/Caches/Google/Chrome/Default/GPUCache",
+            "~/Library/Caches/Google/Chrome/Default/image_cache",
+            "~/Library/Caches/Google/Chrome/Profile 1/Cache",
             "~/Library/Caches/dotslash",
             "~/Library/Caches/com.google.antigravity",
             "~/Library/Caches/com.google.GeminiMacOS",
@@ -121,7 +148,7 @@ final class MacStorageManagerTests: XCTestCase {
         }
     }
 
-    // MARK: - 2. Puppeteer, Firebase & ~/Library/Caches Explicit Rules
+    // MARK: - 2. Puppeteer, Firebase & Narrowed ~/Library/Caches Explicit Rules
 
     func testPuppeteerFirebaseAndLibraryCachesExplicitClassifications() async throws {
         // Puppeteer browsers
@@ -132,8 +159,19 @@ final class MacStorageManagerTests: XCTestCase {
         try writeFile(".cache/firebase/emulators/cloud-firestore-emulator-v1.22.0.jar", sizeBytes: 16384)
         let firebaseDebugLog = try writeFile(".cache/firebase/firebase-debug.log", sizeBytes: 2048)
 
-        // Library/Caches explicit tools
-        try writeFile("Library/Caches/com.openai.atlas/browser-data/Cache/data_1", sizeBytes: 8192)
+        // OpenAI Atlas: verified subcaches + unverified Sparkle & E5RT children
+        try writeFile("Library/Caches/com.openai.atlas/browser-data/host/login-staging-abc/Cache/data_1", sizeBytes: 8192)
+        try writeFile("Library/Caches/com.openai.atlas/browser-data/host/user-xyz/Code Cache/js_1", sizeBytes: 8192)
+        try writeFile("Library/Caches/com.openai.atlas/com.onevcat.Kingfisher.ImageCache/img_1", sizeBytes: 8192)
+        let sparkleFile = try writeFile("Library/Caches/com.openai.atlas/org.sparkle-project.Sparkle/PersistentDownloads/update.dmg", sizeBytes: 8192)
+        let e5rtFile = try writeFile("Library/Caches/com.openai.atlas/com.apple.e5rt.e5bundlecache/model.bundle", sizeBytes: 8192)
+
+        // Google Caches: verified Chrome profile subcaches + unverified sibling
+        try writeFile("Library/Caches/Google/Chrome/Default/Cache/Cache_Data/f_001", sizeBytes: 8192)
+        try writeFile("Library/Caches/Google/Chrome/Default/Code Cache/js/idx", sizeBytes: 8192)
+        let googleUnverifiedFile = try writeFile("Library/Caches/Google/UnknownGoogleService/state.db", sizeBytes: 8192)
+
+        // Other Library/Caches explicit tools
         try writeFile("Library/Caches/dotslash/bin1", sizeBytes: 8192)
         try writeFile("Library/Caches/com.google.antigravity/ShipIt/update.pkg", sizeBytes: 8192)
         try writeFile("Library/Caches/com.google.GeminiMacOS/fsCachedData/f1", sizeBytes: 8192)
@@ -161,8 +199,41 @@ final class MacStorageManagerTests: XCTestCase {
         XCTAssertEqual(firebaseProtected.reclaimableSize, 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: firebaseDebugLog.path))
 
+        // Verify Atlas verified subcaches are SAFE and eligible for Recommended Clean
+        let atlasLoginCache = try XCTUnwrap(items.first { $0.id == "openai-atlas-cache-browser-data-host-login-staging-abc-cache" })
+        let atlasUserCodeCache = try XCTUnwrap(items.first { $0.id == "openai-atlas-cache-browser-data-host-user-xyz-code-cache" })
+        let atlasKingfisher = try XCTUnwrap(items.first { $0.id == "openai-atlas-cache-com-onevcat-kingfisher-imagecache" })
+        for verifiedAtlas in [atlasLoginCache, atlasUserCodeCache, atlasKingfisher] {
+            XCTAssertEqual(verifiedAtlas.riskLevel, .safe)
+            XCTAssertGreaterThan(verifiedAtlas.reclaimableSize, 0)
+            XCTAssertTrue(CleanerViewModel.isEligibleForRecommendedSafeCleanup(verifiedAtlas))
+        }
+
+        // Verify Atlas unverified children (Sparkle, e5bundlecache) are REVIEW, non-selectable, 0 reclaimable, and NEVER in Recommended Clean
+        let atlasUnverified = try XCTUnwrap(items.first { $0.id == "openai-atlas-unverified-review" })
+        XCTAssertEqual(atlasUnverified.riskLevel, .review)
+        XCTAssertEqual(atlasUnverified.reclaimableSize, 0)
+        XCTAssertFalse(atlasUnverified.canBeSelected)
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(atlasUnverified))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sparkleFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: e5rtFile.path))
+
+        // Verify Google verified Chrome subcaches are SAFE and unverified data is REVIEW (never in Recommended Clean)
+        let googleDefaultCache = try XCTUnwrap(items.first { $0.id == "google-caches-chrome-default-cache" })
+        let googleDefaultCodeCache = try XCTUnwrap(items.first { $0.id == "google-caches-chrome-default-code-cache" })
+        XCTAssertEqual(googleDefaultCache.riskLevel, .safe)
+        XCTAssertEqual(googleDefaultCodeCache.riskLevel, .safe)
+        XCTAssertTrue(CleanerViewModel.isEligibleForRecommendedSafeCleanup(googleDefaultCache))
+
+        let googleUnverified = try XCTUnwrap(items.first { $0.id == "google-caches-unverified-review" })
+        XCTAssertEqual(googleUnverified.riskLevel, .review)
+        XCTAssertEqual(googleUnverified.reclaimableSize, 0)
+        XCTAssertFalse(googleUnverified.canBeSelected)
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(googleUnverified))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: googleUnverifiedFile.path))
+
         for safeID in [
-            "openai-atlas-cache", "dotslash-cache", "antigravity-cache",
+            "dotslash-cache", "antigravity-cache",
             "gemini-macos-cache", "antigravity-updater-cache", "notion-updater-cache",
             "react-native-cache", "openai-chat-cache"
         ] {
@@ -220,7 +291,7 @@ final class MacStorageManagerTests: XCTestCase {
         XCTAssertFalse(activeVSCodeCache.canBeSelected)
     }
 
-    // MARK: - 4. Docker CLI Stats Parsing & Volume Protection
+    // MARK: - 4. Docker CLI Stats Parsing, Command Semantics & Volume Protection
 
     func testDockerCLIStatsParsingAndVolumeProtection() async throws {
         let dfOutput = """
@@ -230,15 +301,37 @@ final class MacStorageManagerTests: XCTestCase {
         {"Active":"0","Reclaimable":"500MB","Size":"500MB","TotalCount":"12","Type":"Build Cache"}
         """
 
-        let stats = DockerCleaner.parseDockerSystemDFJSONLines(dfOutput)
+        // Dangling images output (`docker image ls -f dangling=true`): 300MB across 2 dangling images (plus a duplicate tag line for sha256:aaa)
+        let danglingOutput = """
+        sha256:aaa111\t200MB
+        sha256:aaa111\t200MB
+        sha256:bbb222\t100MB
+        """
+
+        // Builder du output (`docker builder du --format "{{json .}}"`): 350MB reclaimable & not in-use/shared, 150MB shared or in-use
+        let builderDUOutput = """
+        {"ID":"b1","Reclaimable":true,"Shared":false,"InUse":false,"Size":"200MB"}
+        {"ID":"b2","Reclaimable":true,"Shared":false,"InUse":false,"Size":"150MB"}
+        {"ID":"b3","Reclaimable":true,"Shared":true,"InUse":false,"Size":"100MB"}
+        {"ID":"b4","Reclaimable":false,"Shared":false,"InUse":true,"Size":"50MB"}
+        """
+
+        let stats = DockerCleaner.parseDockerSystemDFJSONLines(
+            dfOutput,
+            danglingImagesOutput: danglingOutput,
+            builderDUOutput: builderDUOutput
+        )
         XCTAssertEqual(stats.imagesTotalCount, 4)
         XCTAssertEqual(stats.imagesReclaimableBytes, 1_500_000_000)
+        XCTAssertEqual(stats.danglingImagesCount, 2)
+        XCTAssertEqual(stats.danglingImagesReclaimableBytes, 300_000_000)
+        XCTAssertEqual(stats.unusedNonDanglingImagesReclaimableBytes, 1_200_000_000)
         XCTAssertEqual(stats.containersTotalCount, 2)
         XCTAssertEqual(stats.containersStoppedCount, 2)
         XCTAssertEqual(stats.containersReclaimableBytes, 250_000_000)
         XCTAssertEqual(stats.volumesTotalCount, 3)
         XCTAssertEqual(stats.volumesReclaimableBytes, 800_000_000)
-        XCTAssertEqual(stats.buildCacheReclaimableBytes, 500_000_000)
+        XCTAssertEqual(stats.buildCacheReclaimableBytes, 350_000_000)
 
         let runningCleaner = DockerCleaner(
             homeDirectory: tempHome.path,
@@ -248,29 +341,65 @@ final class MacStorageManagerTests: XCTestCase {
         )
         let items = await runningCleaner.scan(snapshot: .empty, ageFilter: .all)
 
+        let rawDisk = try XCTUnwrap(items.first { $0.id == "docker-raw-disk" })
         let buildCache = try XCTUnwrap(items.first { $0.id == "docker-prune-build-cache" })
         let containers = try XCTUnwrap(items.first { $0.id == "docker-prune-stopped-containers" })
-        let images = try XCTUnwrap(items.first { $0.id == "docker-prune-dangling-images" })
+        let danglingImages = try XCTUnwrap(items.first { $0.id == "docker-prune-dangling-images" })
+        let unusedImages = try XCTUnwrap(items.first { $0.id == "docker-prune-unused-images" })
         let volumes = try XCTUnwrap(items.first { $0.id == "docker-prune-volumes" })
 
+        // Docker.raw is strictly NEVER DELETE
+        XCTAssertEqual(rawDisk.riskLevel, .neverDelete)
+        XCTAssertEqual(rawDisk.reclaimableSize, 0)
+        XCTAssertFalse(rawDisk.canBeSelected)
+
+        // Build cache SAFE item matches actual `docker builder prune -f` removable bytes (350 MB, not 500 MB)
         XCTAssertEqual(buildCache.riskLevel, .safe)
-        XCTAssertEqual(buildCache.reclaimableSize, 500_000_000)
+        XCTAssertEqual(buildCache.reclaimableSize, 350_000_000)
+        XCTAssertEqual(buildCache.actionType, .dockerPrune(subcommand: ["builder", "prune", "-f"]))
+        XCTAssertTrue(CleanerViewModel.isEligibleForRecommendedSafeCleanup(buildCache))
+
+        // Stopped containers SAFE item matches `docker container prune -f` (250 MB)
         XCTAssertEqual(containers.riskLevel, .safe)
         XCTAssertEqual(containers.reclaimableSize, 250_000_000)
-        XCTAssertEqual(images.riskLevel, .safe)
-        XCTAssertEqual(images.reclaimableSize, 1_500_000_000)
+        XCTAssertEqual(containers.actionType, .dockerPrune(subcommand: ["container", "prune", "-f"]))
+        XCTAssertTrue(CleanerViewModel.isEligibleForRecommendedSafeCleanup(containers))
+
+        // Dangling images SAFE item matches `docker image prune -f` (300 MB dangling only, NOT 1.5 GB total unused)
+        XCTAssertEqual(danglingImages.riskLevel, .safe)
+        XCTAssertEqual(danglingImages.reclaimableSize, 300_000_000)
+        XCTAssertEqual(danglingImages.actionType, .dockerPrune(subcommand: ["image", "prune", "-f"]))
+        XCTAssertTrue(CleanerViewModel.isEligibleForRecommendedSafeCleanup(danglingImages))
+
+        // Unused non-dangling images item uses `docker image prune -a -f`, is REVIEW, and reports the 1.2 GB beyond dangling
+        XCTAssertEqual(unusedImages.riskLevel, .review)
+        XCTAssertEqual(unusedImages.reclaimableSize, 1_200_000_000)
+        XCTAssertEqual(unusedImages.actionType, .dockerPrune(subcommand: ["image", "prune", "-a", "-f"]))
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(unusedImages))
 
         // Volumes must NEVER be SAFE automatically
         XCTAssertEqual(volumes.riskLevel, .caution)
+        XCTAssertEqual(volumes.reclaimableSize, 800_000_000)
+        XCTAssertEqual(volumes.actionType, .dockerPrune(subcommand: ["volume", "prune", "-f"]))
         XCTAssertNotEqual(volumes.riskLevel, .safe)
         XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(volumes))
+
+        // When `docker system df` is parsed WITHOUT `docker image ls -f dangling=true`, danglingImagesReclaimableBytes is conservatively 0
+        let dfOnlyStats = DockerCleaner.parseDockerSystemDFJSONLines(dfOutput)
+        XCTAssertEqual(dfOnlyStats.danglingImagesReclaimableBytes, 0)
+        XCTAssertEqual(dfOnlyStats.unusedNonDanglingImagesReclaimableBytes, 1_500_000_000)
     }
 
-    // MARK: - 5. Simulator Model, Last Used & Recommendation Badge Tests
+    // MARK: - 5. Simulator Model, Last Used & 30-Day Recommendation Threshold Tests
 
     func testSimulatorDeviceModelLastUsedAndRecommendationBadges() throws {
-        let recentDateISO = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3 * 86400)) // 3 days ago -> KEEP
-        let oldDateISO = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-72 * 86400))   // 72 days ago -> REVIEW
+        let now = Date()
+        let iso = ISO8601DateFormatter()
+        let day3ISO = iso.string(from: now.addingTimeInterval(-3 * 86400))   // 3 days  -> KEEP
+        let day20ISO = iso.string(from: now.addingTimeInterval(-20 * 86400)) // 20 days -> KEEP
+        let day30ISO = iso.string(from: now.addingTimeInterval(-30 * 86400)) // 30 days -> KEEP
+        let day31ISO = iso.string(from: now.addingTimeInterval(-31 * 86400)) // 31 days -> REVIEW
+        let day45ISO = iso.string(from: now.addingTimeInterval(-45 * 86400)) // 45 days -> REVIEW
 
         let json = """
         {
@@ -278,23 +407,72 @@ final class MacStorageManagerTests: XCTestCase {
             "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
               {
                 "udid": "11111111-1111-1111-1111-111111111111",
-                "name": "iPhone 18 Pro",
+                "name": "iPhone 18 Pro (3d)",
                 "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro",
                 "state": "Shutdown",
                 "isAvailable": true,
                 "dataPathSize": 4200000000,
                 "logPathSize": 0,
-                "lastUsedAt": "\(recentDateISO)"
+                "lastUsedAt": "\(day3ISO)"
               },
               {
                 "udid": "22222222-2222-2222-2222-222222222222",
-                "name": "iPhone 16e",
+                "name": "iPhone 18 (20d)",
+                "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-18",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 3900000000,
+                "logPathSize": 0,
+                "lastUsedAt": "\(day20ISO)"
+              },
+              {
+                "udid": "33333333-3333-3333-3333-333333333333",
+                "name": "iPhone 17 Pro (30d)",
+                "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 3700000000,
+                "logPathSize": 0,
+                "lastUsedAt": "\(day30ISO)"
+              },
+              {
+                "udid": "44444444-4444-4444-4444-444444444444",
+                "name": "iPhone 16e (31d)",
                 "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-16e",
                 "state": "Shutdown",
                 "isAvailable": true,
-                "dataPathSize": 3800000000,
+                "dataPathSize": 3600000000,
                 "logPathSize": 0,
-                "lastUsedAt": "\(oldDateISO)"
+                "lastUsedAt": "\(day31ISO)"
+              },
+              {
+                "udid": "55555555-5555-5555-5555-555555555555",
+                "name": "iPhone 15 (45d)",
+                "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 3500000000,
+                "logPathSize": 0,
+                "lastUsedAt": "\(day45ISO)"
+              },
+              {
+                "udid": "66666666-6666-6666-6666-666666666666",
+                "name": "iPhone SE (Unknown Usage)",
+                "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 3100000000,
+                "logPathSize": 0
+              },
+              {
+                "udid": "77777777-7777-7777-7777-777777777777",
+                "name": "iPhone 18 Pro Max (Booted 45d)",
+                "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro-Max",
+                "state": "Booted",
+                "isAvailable": true,
+                "dataPathSize": 4500000000,
+                "logPathSize": 0,
+                "lastUsedAt": "\(day45ISO)"
               }
             ]
           }
@@ -302,18 +480,179 @@ final class MacStorageManagerTests: XCTestCase {
         """.data(using: .utf8)!
 
         let items = try SimulatorCleaner.parseDevicesJSON(json, homeDirectory: tempHome.path)
-        let recentSim = try XCTUnwrap(items.first { $0.id == "sim-device-11111111-1111-1111-1111-111111111111" })
-        let oldSim = try XCTUnwrap(items.first { $0.id == "sim-device-22222222-2222-2222-2222-222222222222" })
+        let sim3d = try XCTUnwrap(items.first { $0.id == "sim-device-11111111-1111-1111-1111-111111111111" })
+        let sim20d = try XCTUnwrap(items.first { $0.id == "sim-device-22222222-2222-2222-2222-222222222222" })
+        let sim30d = try XCTUnwrap(items.first { $0.id == "sim-device-33333333-3333-3333-3333-333333333333" })
+        let sim31d = try XCTUnwrap(items.first { $0.id == "sim-device-44444444-4444-4444-4444-444444444444" })
+        let sim45d = try XCTUnwrap(items.first { $0.id == "sim-device-55555555-5555-5555-5555-555555555555" })
+        let simUnknown = try XCTUnwrap(items.first { $0.id == "sim-device-66666666-6666-6666-6666-666666666666" })
+        let simBooted = try XCTUnwrap(items.first { $0.id == "sim-device-77777777-7777-7777-7777-777777777777" })
 
-        XCTAssertEqual(recentSim.simulatorMetadata?.deviceModel, "iPhone 18 Pro")
-        XCTAssertEqual(recentSim.simulatorMetadata?.recommendationBadgeText, "KEEP")
-        XCTAssertNotNil(recentSim.lastUsed)
-        XCTAssertTrue(recentSim.usageDateDescription.hasPrefix("Last used:"))
+        XCTAssertEqual(sim3d.simulatorMetadata?.deviceModel, "iPhone 18 Pro")
+        XCTAssertEqual(sim3d.simulatorMetadata?.recommendationBadgeText, "KEEP")
+        XCTAssertEqual(sim20d.simulatorMetadata?.recommendationBadgeText, "KEEP")
+        XCTAssertEqual(sim30d.simulatorMetadata?.recommendationBadgeText, "KEEP")
+        XCTAssertEqual(sim31d.simulatorMetadata?.recommendationBadgeText, "REVIEW")
+        XCTAssertEqual(sim45d.simulatorMetadata?.recommendationBadgeText, "REVIEW")
+        XCTAssertEqual(simUnknown.simulatorMetadata?.recommendationBadgeText, "REVIEW")
+        XCTAssertEqual(simBooted.simulatorMetadata?.recommendationBadgeText, "KEEP")
 
-        XCTAssertEqual(oldSim.simulatorMetadata?.deviceModel, "iPhone 16e")
-        XCTAssertEqual(oldSim.simulatorMetadata?.recommendationBadgeText, "REVIEW")
-        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(recentSim))
-        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(oldSim))
+        // Favorite simulator is always KEEP even when older than 30 days
+        let favMeta = SimulatorMetadata(
+            udid: "88888888-8888-8888-8888-888888888888",
+            deviceModel: "iPhone 16",
+            runtimeName: "iOS 26.3",
+            state: "Shutdown",
+            isAvailable: true,
+            lastUsedAt: now.addingTimeInterval(-90 * 86400),
+            isFavorite: true
+        )
+        XCTAssertEqual(favMeta.recommendationBadge(referenceDate: now), "KEEP")
+
+        // Unavailable simulator preserves UNAVAILABLE badge
+        let unavailMeta = SimulatorMetadata(
+            udid: "99999999-9999-9999-9999-999999999999",
+            deviceModel: "iPhone 14",
+            runtimeName: "iOS 17.0",
+            state: "Shutdown",
+            isAvailable: false,
+            lastUsedAt: now.addingTimeInterval(-3 * 86400),
+            isFavorite: false
+        )
+        XCTAssertEqual(unavailMeta.recommendationBadge(referenceDate: now), "UNAVAILABLE")
+
+        // Simulator deletion continues to use official xcrun simctl
+        XCTAssertEqual(sim31d.actionType, .simctlDeleteDevice(udid: "44444444-4444-4444-4444-444444444444"))
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(sim3d))
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(sim31d))
+    }
+
+    // MARK: - 5b. Official Android AVD Deletion (`avdmanager delete avd -n <AVD_NAME>`) Tests
+
+    func testAndroidAVDUsesOfficialAVDManagerAndNeverFallsBackToManualDirectoryDeletion() async throws {
+        // Create a mock AVD directory and .ini file in tempHome/.android/avd
+        let avdFile = try writeFile(".android/avd/medium_phone.avd/userdata-qemu.img", sizeBytes: 32768)
+        try writeFile(
+            ".android/avd/medium_phone.avd/config.ini",
+            textContent: "avd.ini.displayname=Medium Phone\nabi.type=arm64-v8a\nimage.sysdir.1=system-images/android-36.1/google_apis_playstore/arm64-v8a/\n"
+        )
+        let iniFile = try writeFile(".android/avd/medium_phone.ini", textContent: "path=\(tempHome.path)/.android/avd/medium_phone.avd\n")
+
+        // 1. Validate AVD name sanitization
+        XCTAssertTrue(AndroidCleaner.isValidAVDName("medium_phone"))
+        XCTAssertTrue(AndroidCleaner.isValidAVDName("Pixel_9_Pro_API_36.1-ext"))
+        XCTAssertFalse(AndroidCleaner.isValidAVDName(""))
+        XCTAssertFalse(AndroidCleaner.isValidAVDName("../medium_phone"))
+        XCTAssertFalse(AndroidCleaner.isValidAVDName("foo/bar"))
+        XCTAssertFalse(AndroidCleaner.isValidAVDName("-n"))
+        XCTAssertFalse(AndroidCleaner.isValidAVDName("name with spaces"))
+
+        // 2. Scan with AndroidCleaner: AVD must be REVIEW, never in Recommended Clean, and use .avdManagerDelete
+        let cleaner = AndroidCleaner(homeDirectory: tempHome.path)
+        let items = await cleaner.scan(snapshot: .empty, ageFilter: .all)
+        let avdItem = try XCTUnwrap(items.first { $0.id == "android-avd-medium_phone" })
+
+        XCTAssertEqual(avdItem.riskLevel, .review)
+        XCTAssertTrue(avdItem.path.hasSuffix("/.android/avd/medium_phone.avd"))
+        XCTAssertEqual(avdItem.actionType, .avdManagerDelete(avdName: "medium_phone", avdPath: avdItem.path))
+        XCTAssertEqual(avdItem.exactCommandOrPathDescription, "avdmanager delete avd -n medium_phone")
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(avdItem))
+
+        final class AVDTestRecorder: @unchecked Sendable {
+            var trashCalled = false
+            var executedCommand: [String] = []
+        }
+        let recorder = AVDTestRecorder()
+
+        // 3. When avdmanager is unavailable, execution is BLOCKED and NEVER deletes .avd directory manually
+        let missingToolExecutor = CleanupExecutor(
+            validator: validator,
+            freeSpaceProvider: { 100_000_000_000 },
+            processChecker: { _ in [] },
+            trashHandler: { _ in recorder.trashCalled = true },
+            shellRunner: { _, _ in
+                XCTFail("shellRunner must not be called when avdmanager is missing")
+                return ShellResult(exitCode: 1, stdout: "", stderr: "")
+            },
+            avdManagerResolver: { nil }
+        )
+
+        do {
+            _ = try await missingToolExecutor.execute(avdItem)
+            XCTFail("Expected CleanerError.commandFailed when avdmanager is unavailable")
+        } catch let error as CleanerError {
+            guard case .commandFailed(let msg) = error else {
+                XCTFail("Expected CleanerError.commandFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(msg.contains("avdmanager"))
+        }
+        XCTAssertFalse(recorder.trashCalled, "Must never fall back to moving .avd directory to Trash")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: avdFile.path), "AVD userdata image must remain untouched when avdmanager is unavailable")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: iniFile.path))
+
+        // 4. When emulator process is active immediately before deletion, execution is BLOCKED
+        let activeProcessExecutor = CleanupExecutor(
+            validator: validator,
+            freeSpaceProvider: { 100_000_000_000 },
+            processChecker: { cat in cat == .android ? ["qemu-system-aarch64"] : [] },
+            trashHandler: { _ in recorder.trashCalled = true },
+            shellRunner: { _, _ in
+                XCTFail("shellRunner must not be called when emulator is running")
+                return ShellResult(exitCode: 1, stdout: "", stderr: "")
+            },
+            avdManagerResolver: { "/mock/sdk/cmdline-tools/latest/bin/avdmanager" }
+        )
+        do {
+            _ = try await activeProcessExecutor.execute(avdItem)
+            XCTFail("Expected runningProcessActive when emulator process is active")
+        } catch let error as CleanerError {
+            XCTAssertEqual(error, .runningProcessActive(appName: "qemu-system-aarch64", categoryName: "Android"))
+        }
+
+        // 5. When live hardware-qemu.ini.lock has an active PID (current test process PID), execution is BLOCKED
+        let lockFile = try writeFile(".android/avd/medium_phone.avd/hardware-qemu.ini.lock", textContent: "\(getpid())\n")
+        let lockExecutor = CleanupExecutor(
+            validator: validator,
+            freeSpaceProvider: { 100_000_000_000 },
+            processChecker: { _ in [] },
+            trashHandler: { _ in recorder.trashCalled = true },
+            shellRunner: { _, _ in
+                XCTFail("shellRunner must not be called when AVD lock PID is alive")
+                return ShellResult(exitCode: 1, stdout: "", stderr: "")
+            },
+            avdManagerResolver: { "/mock/sdk/cmdline-tools/latest/bin/avdmanager" }
+        )
+        do {
+            _ = try await lockExecutor.execute(avdItem)
+            XCTFail("Expected runningProcessActive when lock PID is active")
+        } catch let error as CleanerError {
+            guard case .runningProcessActive(let appName, _) = error else {
+                XCTFail("Expected runningProcessActive, got \(error)")
+                return
+            }
+            XCTAssertTrue(appName.contains("PID"))
+        }
+        try FileManager.default.removeItem(at: lockFile)
+
+        // 6. When avdmanager is available and AVD is inactive, executes `avdmanager delete avd -n medium_phone`
+        let mockAVDManagerPath = "/mock/sdk/cmdline-tools/latest/bin/avdmanager"
+        let validExecutor = CleanupExecutor(
+            validator: validator,
+            freeSpaceProvider: { 100_000_000_000 },
+            processChecker: { _ in [] },
+            trashHandler: { _ in recorder.trashCalled = true },
+            shellRunner: { exe, args in
+                recorder.executedCommand = [exe] + args
+                return ShellResult(exitCode: 0, stdout: "AVD 'medium_phone' deleted.", stderr: "")
+            },
+            avdManagerResolver: { mockAVDManagerPath }
+        )
+        let result = try await validExecutor.execute(avdItem)
+        XCTAssertEqual(result.status, .cleaned)
+        XCTAssertEqual(result.action, .avdManagerDelete)
+        XCTAssertEqual(recorder.executedCommand, [mockAVDManagerPath, "delete", "avd", "-n", "medium_phone"])
+        XCTAssertFalse(recorder.trashCalled)
     }
 
     // MARK: - 6. Path Modified After Scan Protection in CleanupExecutor
