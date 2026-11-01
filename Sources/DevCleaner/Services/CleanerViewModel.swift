@@ -5,6 +5,7 @@ public enum MainAnalyzerTab: String, CaseIterable, Identifiable, Sendable {
     case systemAndTools = "System & Tools"
     case projectStorage = "Project Storage"
     case worktrees = "Worktrees"
+    case macStorage = "Mac Storage"
 
     public var id: String { rawValue }
 
@@ -13,6 +14,7 @@ public enum MainAnalyzerTab: String, CaseIterable, Identifiable, Sendable {
         case .systemAndTools: return "externaldrive.fill.badge.checkmark"
         case .projectStorage: return "folder.fill.badge.gearshape"
         case .worktrees: return "point.3.connected.trianglepath.dotted"
+        case .macStorage: return "internaldrive.fill"
         }
     }
 }
@@ -53,7 +55,7 @@ public final class CleanerViewModel: ObservableObject {
     @Published public var statusBannerMessage: String? = nil
     @Published public var lastCleanupSummary: CleanupBatchSummary? = nil
 
-    // Project Storage Analyzer & Worktree Analyzer state
+    // Project Storage Analyzer, Mac Storage & Worktree Analyzer state
     @Published public var projectsRootPath: String = ProjectStorageAnalyzer.defaultDeveloperRoot
     @Published public var projectReports: [ProjectStorageReport] = []
     @Published public var projectSummary: ProjectStorageSummary = .empty
@@ -61,6 +63,8 @@ public final class CleanerViewModel: ObservableObject {
     @Published public var projectScanProgressText: String = ""
     @Published public var worktreeRecords: [GitWorktreeRecord] = []
     @Published public var isScanningWorktrees: Bool = false
+    @Published public var macStorageSummary: MacStorageSummary = .empty
+    @Published public var isScanningMacStorage: Bool = false
 
     // Sheet states
     @Published public var showingPreviewSheet: Bool = false
@@ -70,6 +74,7 @@ public final class CleanerViewModel: ObservableObject {
 
     private var projectScanCancellation: AtomicCancellationFlag?
     private var projectScanTask: Task<Void, Never>?
+    private var activeScanToken = UUID()
 
     private let providers: [CleanerProvider] = [
         StandardCacheCleaner(category: .xcode),
@@ -88,6 +93,7 @@ public final class CleanerViewModel: ObservableObject {
 
     private let projectAnalyzer = ProjectStorageAnalyzer()
     private let worktreeAnalyzer = GitWorktreeAnalyzer()
+    private let macStorageAnalyzer = MacStorageAnalyzer()
     private let executor = CleanupExecutor()
 
     public init() {
@@ -122,7 +128,10 @@ public final class CleanerViewModel: ObservableObject {
     }
 
     public func performScan() async {
-        guard !isScanning else { return }
+        // Cancel any previous scan if user triggers Scan Now again
+        projectScanCancellation?.cancel()
+        let scanToken = UUID()
+        self.activeScanToken = scanToken
         isScanning = true
 
         let currentFilter = ageFilter
@@ -136,12 +145,14 @@ public final class CleanerViewModel: ObservableObject {
         self.projectScanCancellation = cancelFlag
         self.isScanningProjects = true
         self.isScanningWorktrees = true
+        self.isScanningMacStorage = true
         self.projectScanProgressText = "Scanning \(rootToScan)..."
 
         let pAnalyzer = self.projectAnalyzer
         let wAnalyzer = self.worktreeAnalyzer
+        let mAnalyzer = self.macStorageAnalyzer
 
-        // Start Project Storage & Worktrees scan concurrently in the background
+        // Start Project Storage, Mac Storage Application Support, and Worktrees scans concurrently
         let projectsTask = Task.detached(priority: .userInitiated) {
             await pAnalyzer.analyzeProjects(
                 in: rootToScan,
@@ -149,9 +160,18 @@ public final class CleanerViewModel: ObservableObject {
                 shouldCancel: { cancelFlag.isCancelled },
                 onProgress: { index, total, projectName in
                     Task { @MainActor in
+                        guard self.activeScanToken == scanToken else { return }
                         self.projectScanProgressText = "Analyzing project \(index)/\(total): \(projectName)..."
                     }
                 }
+            )
+        }
+
+        let macAdditionalTask = Task.detached(priority: .userInitiated) {
+            mAnalyzer.scanAdditionalMacStorageItems(
+                snapshot: snapshot,
+                ageFilter: currentFilter,
+                shouldCancel: { cancelFlag.isCancelled }
             )
         }
 
@@ -163,7 +183,8 @@ public final class CleanerViewModel: ObservableObject {
             )
         }
 
-        var allScanned: [CleanableItem] = []
+        // Phase 1: System & Tools providers
+        var providerScanned: [CleanableItem] = []
         await withTaskGroup(of: [CleanableItem].self) { group in
             for provider in providers {
                 group.addTask {
@@ -171,15 +192,17 @@ public final class CleanerViewModel: ObservableObject {
                 }
             }
             for await result in group {
-                allScanned.append(contentsOf: result)
+                providerScanned.append(contentsOf: result)
             }
         }
+
+        guard self.activeScanToken == scanToken, !cancelFlag.isCancelled else { return }
 
         let simCleaner = SimulatorCleaner()
         let runtimes = await simCleaner.fetchRuntimes()
 
         let categoryOrder = CleanerCategory.allCases
-        allScanned.sort { a, b in
+        providerScanned.sort { a, b in
             let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
             let idxB = categoryOrder.firstIndex(of: b.category) ?? 99
             if idxA != idxB { return idxA < idxB }
@@ -188,32 +211,63 @@ public final class CleanerViewModel: ObservableObject {
         }
 
         let hadPriorSelection = !selectedIDs.isEmpty
-        self.items = allScanned
+        self.items = providerScanned
         self.simulatorRuntimes = runtimes
         self.storageMetrics = metrics
         self.freeSpaceBytes = metrics.macOSAvailableBytes
         self.lastScanDate = Date()
 
+        // Publish initial Mac Storage view with System & Tools while Project Storage finishes
+        let additionalMacItems = await macAdditionalTask.value
+        guard self.activeScanToken == scanToken, !cancelFlag.isCancelled else { return }
+
+        self.macStorageSummary = mAnalyzer.buildSummary(
+            providerItems: providerScanned,
+            additionalItems: additionalMacItems,
+            projectSummary: self.projectSummary,
+            projectsRootPath: rootToScan
+        )
+
+        var combinedItems = MacStorageAnalyzer.deduplicateItems(providerScanned + additionalMacItems)
+        combinedItems.sort { a, b in
+            let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
+            let idxB = categoryOrder.firstIndex(of: b.category) ?? 99
+            if idxA != idxB { return idxA < idxB }
+            if a.riskLevel != b.riskLevel { return a.riskLevel < b.riskLevel }
+            return a.physicalSize > b.physicalSize
+        }
+        self.items = combinedItems
+
         if !hadPriorSelection {
             selectRecommendedSafeItems()
         }
 
+        // Phase 2: Project Storage completes -> update Project Storage & Mac Storage
         let (pReports, pSummary) = await projectsTask.value
-        let wRecords = await worktreesTask.value
+        guard self.activeScanToken == scanToken, !cancelFlag.isCancelled else { return }
 
         self.projectReports = pReports
         self.projectSummary = pSummary
-        self.worktreeRecords = wRecords
         self.isScanningProjects = false
-        self.isScanningWorktrees = false
         self.projectScanProgressText = ""
 
+        // Phase 3: Finalize Mac Storage summary with deduplicated Project Storage
+        self.macStorageSummary = mAnalyzer.buildSummary(
+            providerItems: providerScanned,
+            additionalItems: additionalMacItems,
+            projectSummary: pSummary,
+            projectsRootPath: rootToScan
+        )
+        self.isScanningMacStorage = false
+
         // Append cleanable project artifact items so they integrate with selection & preview
+        var allScanned = combinedItems
         for report in pReports {
             for artifact in report.artifacts where artifact.reclaimableBytes > 0 {
                 allScanned.append(artifact.cleanableItem)
             }
         }
+        allScanned = MacStorageAnalyzer.deduplicateItems(allScanned)
 
         allScanned.sort { a, b in
             let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
@@ -231,6 +285,12 @@ public final class CleanerViewModel: ObservableObject {
             selectedIDs = selectedIDs.intersection(validSelectableIDs)
         }
 
+        // Phase 4: Worktrees completes
+        let wRecords = await worktreesTask.value
+        guard self.activeScanToken == scanToken, !cancelFlag.isCancelled else { return }
+        self.worktreeRecords = wRecords
+        self.isScanningWorktrees = false
+
         isScanning = false
     }
 
@@ -244,6 +304,7 @@ public final class CleanerViewModel: ObservableObject {
         let snapshot = await ProcessMonitor.shared.captureSnapshot()
         let pAnalyzer = self.projectAnalyzer
         let wAnalyzer = self.worktreeAnalyzer
+        let mAnalyzer = self.macStorageAnalyzer
 
         let (pReports, pSummary) = await Task.detached(priority: .userInitiated) {
             await pAnalyzer.analyzeProjects(
@@ -275,12 +336,21 @@ public final class CleanerViewModel: ObservableObject {
 
         // Replace .projectStorage items in self.items
         var nonProjectItems = self.items.filter { $0.category != .projectStorage }
+        let additionalItems = nonProjectItems.filter { $0.id.hasPrefix("appsupport-") || $0.id.hasPrefix("logs-") }
+        let providerOnlyItems = nonProjectItems.filter { !$0.id.hasPrefix("appsupport-") && !$0.id.hasPrefix("logs-") }
+        self.macStorageSummary = mAnalyzer.buildSummary(
+            providerItems: providerOnlyItems,
+            additionalItems: additionalItems,
+            projectSummary: pSummary,
+            projectsRootPath: rootToScan
+        )
+
         for report in pReports {
             for artifact in report.artifacts where artifact.reclaimableBytes > 0 {
                 nonProjectItems.append(artifact.cleanableItem)
             }
         }
-        self.items = nonProjectItems
+        self.items = MacStorageAnalyzer.deduplicateItems(nonProjectItems)
     }
 
     public func cancelProjectScan() {
@@ -334,14 +404,32 @@ public final class CleanerViewModel: ObservableObject {
         }
     }
 
+    nonisolated public static func isEligibleForRecommendedSafeCleanup(_ item: CleanableItem) -> Bool {
+        guard item.riskLevel == .safe && item.canBeSelected && item.reclaimableSize > 0 else {
+            return false
+        }
+        // Explicitly exclude simulators, Docker volumes, VM bundles, Codex runtimes, node_modules, and worktrees
+        if item.category == .iosSimulators || item.simulatorMetadata != nil || item.id.hasPrefix("sim-") {
+            return false
+        }
+        if item.id == "docker-prune-volumes" || item.id == "claude-vm-bundles" || item.id == "codex-runtimes-cache" {
+            return false
+        }
+        let lowerPath = item.path.lowercased()
+        if lowerPath.hasSuffix("/node_modules") || lowerPath.contains("/node_modules/") || lowerPath.contains("/.claude/worktrees") {
+            return false
+        }
+        return true
+    }
+
     public func selectRecommendedSafeItems() {
         developmentModeActive = false
         selectedIDs = Set(
             items
-                .filter { $0.riskLevel == .safe && $0.canBeSelected && $0.reclaimableSize > 0 }
+                .filter { Self.isEligibleForRecommendedSafeCleanup($0) }
                 .map { $0.id }
         )
-        statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items, protected subtrees, simulators, VMs, and AI models are excluded."
+        statusBannerMessage = "Recommended SAFE cleanup selected (\(selectedItems.count) items, \(Formatters.bytes(selectedReclaimableBytes))). Review/Caution items, protected subtrees, simulators, Docker volumes, VMs, runtimes, node_modules, and worktrees are excluded."
     }
 
     public func selectSafeProjectArtifactsOnly() {

@@ -149,6 +149,21 @@ public struct ActiveProcessSnapshot: Sendable {
         return Array(matched).sorted()
     }
 
+    public func matchingProcesses(forAppNames appNames: [String], commandTokens: [String] = []) -> [String] {
+        var matched = Set<String>()
+        for appName in appNames {
+            if runningAppNames.contains(where: { $0.caseInsensitiveCompare(appName) == .orderedSame }) {
+                matched.insert(appName)
+            }
+        }
+        for token in commandTokens {
+            if activeLines.contains(where: { $0.localizedCaseInsensitiveContains(token) }) {
+                matched.insert(appNames.first ?? token)
+            }
+        }
+        return Array(matched).sorted()
+    }
+
     public func matchingProcesses(forProjectPath projectPath: String) -> [String] {
         var matched = Set<String>()
         for line in activeLines {

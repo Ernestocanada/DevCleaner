@@ -96,6 +96,29 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Keychains",
             "\(homeDirectory)/Library/Developer/CoreDevice",
             "\(homeDirectory)/Library/Developer/CoreDevice/DeviceFS",
+            "\(homeDirectory)/Library/Developer/Xcode/Archives",
+            "\(homeDirectory)/Library/Developer/Xcode/UserData",
+            "\(homeDirectory)/Library/Android/sdk/ndk",
+            "\(homeDirectory)/Library/Android/sdk/system-images",
+            "\(homeDirectory)/Library/Android/sdk/platforms",
+            "\(homeDirectory)/Library/Android/sdk/build-tools",
+            "\(homeDirectory)/Library/Android/sdk/emulator",
+            "\(homeDirectory)/Library/Containers/com.docker.docker",
+            "\(homeDirectory)/Library/Application Support/Claude/local-agent-mode-sessions",
+            "\(homeDirectory)/Library/Application Support/Claude/claude-code-sessions",
+            "\(homeDirectory)/Library/Application Support/Claude/claude-code-vm",
+            "\(homeDirectory)/Library/Application Support/Codex/artifact-sessions",
+            "\(homeDirectory)/Library/Application Support/Codex/Default",
+            "\(homeDirectory)/Library/Application Support/Code/User",
+            "\(homeDirectory)/Library/Application Support/Code/Backups",
+            "\(homeDirectory)/Library/Application Support/Antigravity/User",
+            "\(homeDirectory)/Library/Application Support/Antigravity/Backups",
+            "\(homeDirectory)/Library/Application Support/Cursor/User",
+            "\(homeDirectory)/Library/Application Support/Cursor/Backups",
+            "\(homeDirectory)/Library/Application Support/Notion/Partitions",
+            "\(homeDirectory)/Library/Application Support/Google/Chrome",
+            "\(homeDirectory)/Library/Application Support/Google/DriveFS",
+            "\(homeDirectory)/Library/Application Support/OutSystems",
             "/Library/Developer/CoreSimulator/Volumes",
             "/System",
             "/Users/Shared",
@@ -105,11 +128,17 @@ public struct SafetyValidator: Sendable {
 
     /// Explicitly allowed prefixes where deletion (Trash or subdirectories) is permitted.
     public var allowedRootPrefixes: [String] {
-        [
+        var prefixes: [String] = [
             "\(homeDirectory)/Library/Developer/Xcode/DerivedData",
+            "\(homeDirectory)/Library/Developer/Xcode/DocumentationCache",
             "\(homeDirectory)/Library/Developer/Xcode/iOS DeviceSupport",
             "\(homeDirectory)/Library/Developer/Xcode/watchOS DeviceSupport",
             "\(homeDirectory)/Library/Logs/CoreSimulator",
+            "\(homeDirectory)/Library/Logs/Claude",
+            "\(homeDirectory)/Library/Logs/com.openai.codex",
+            "\(homeDirectory)/Library/Logs/Xcode",
+            "\(homeDirectory)/Library/Logs/Antigravity",
+            "\(homeDirectory)/Library/Logs/GitHubCopilot",
             "\(homeDirectory)/Library/Caches/com.apple.dt.Xcode",
             "\(homeDirectory)/Library/Caches/org.swift.swiftpm",
             "\(homeDirectory)/Library/Caches/CocoaPods",
@@ -120,12 +149,30 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Caches/Yarn",
             "\(homeDirectory)/Library/Caches/pnpm",
             "\(homeDirectory)/Library/Caches/ms-playwright",
+            "\(homeDirectory)/Library/Caches/ms-playwright-go",
+            "\(homeDirectory)/Library/Caches/com.openai.atlas",
+            "\(homeDirectory)/Library/Caches/dotslash",
+            "\(homeDirectory)/Library/Caches/com.google.antigravity",
+            "\(homeDirectory)/Library/Caches/com.google.GeminiMacOS",
+            "\(homeDirectory)/Library/Caches/antigravity-updater",
+            "\(homeDirectory)/Library/Caches/notion-updater",
+            "\(homeDirectory)/Library/Caches/ReactNative",
+            "\(homeDirectory)/Library/Caches/node-gyp",
+            "\(homeDirectory)/Library/Caches/com.openai.chat",
+            "\(homeDirectory)/Library/Caches/typescript",
+            "\(homeDirectory)/Library/Caches/statsig-cache",
             "\(homeDirectory)/.gradle/caches",
             "\(homeDirectory)/.gradle/daemon",
             "\(homeDirectory)/.npm/_cacache",
             "\(homeDirectory)/.npm/_npx",
             "\(homeDirectory)/.npm/_logs",
             "\(homeDirectory)/.cache/codex-runtimes",
+            "\(homeDirectory)/.cache/puppeteer",
+            "\(homeDirectory)/.cache/firebase/emulators",
+            "\(homeDirectory)/.cache/node",
+            "\(homeDirectory)/.cache/node/corepack",
+            "\(homeDirectory)/.cache/pkg",
+            "\(homeDirectory)/.cache/mesa_shader_cache",
             "\(homeDirectory)/.android/avd",
             "\(homeDirectory)/.android/cache",
             "\(homeDirectory)/Library/Android/sdk/.temp",
@@ -134,7 +181,10 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Application Support/Claude/GPUCache",
             "\(homeDirectory)/Library/Application Support/Claude/DawnWebGPUCache",
             "\(homeDirectory)/Library/Application Support/Claude/DawnGraphiteCache",
+            "\(homeDirectory)/Library/Application Support/Claude/GraphiteDawnCache",
+            "\(homeDirectory)/Library/Application Support/Claude/GPUPersistentCache",
             "\(homeDirectory)/Library/Application Support/Claude/ShaderCache",
+            "\(homeDirectory)/Library/Application Support/Claude/Crashpad",
             "\(homeDirectory)/Library/Application Support/Claude/claude-code",
             "\(homeDirectory)/Library/Application Support/Claude/simulator-builds",
             "\(homeDirectory)/Library/Application Support/Claude/vm_bundles",
@@ -143,10 +193,40 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Application Support/Codex/GPUCache",
             "\(homeDirectory)/Library/Application Support/Codex/DawnWebGPUCache",
             "\(homeDirectory)/Library/Application Support/Codex/DawnGraphiteCache",
+            "\(homeDirectory)/Library/Application Support/Codex/GraphiteDawnCache",
+            "\(homeDirectory)/Library/Application Support/Codex/GrShaderCache",
+            "\(homeDirectory)/Library/Application Support/Codex/GPUPersistentCache",
             "\(homeDirectory)/Library/Application Support/Codex/ShaderCache",
+            "\(homeDirectory)/Library/Application Support/Codex/Crashpad",
             "\(homeDirectory)/Library/Application Support/com.google.AIEdgeForesight/models",
-            "\(homeDirectory)/Library/Application Support/com.google.AIEdgeForesight/model_cache"
+            "\(homeDirectory)/Library/Application Support/com.google.AIEdgeForesight/model_cache",
+            "\(homeDirectory)/Library/Application Support/Google/GoogleUpdater/crx_cache"
         ]
+
+        let electronSubcaches = [
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "DawnWebGPUCache",
+            "DawnGraphiteCache",
+            "GraphiteDawnCache",
+            "GPUPersistentCache",
+            "ShaderCache",
+            "CachedData",
+            "CachedExtensionVSIXs",
+            "logs",
+            "Crashpad"
+        ]
+        for app in ["Code", "Antigravity", "Cursor"] {
+            for sub in electronSubcaches {
+                prefixes.append("\(homeDirectory)/Library/Application Support/\(app)/\(sub)")
+            }
+        }
+        for sub in ["Cache", "Code Cache", "GPUCache", "DawnWebGPUCache", "DawnGraphiteCache", "ShaderCache", "Crashpad"] {
+            prefixes.append("\(homeDirectory)/Library/Application Support/Notion/\(sub)")
+        }
+
+        return prefixes
     }
 
     /// Forbidden path components anywhere in the path
@@ -194,7 +274,9 @@ public struct SafetyValidator: Sendable {
         ".keystore",
         ".mobileprovision",
         ".mobileconfig",
-        ".csr"
+        ".csr",
+        ".xcarchive",
+        ".ipa"
     ]
 
     public func isForbiddenComponentName(_ comp: String) -> Bool {
@@ -203,6 +285,9 @@ public struct SafetyValidator: Sendable {
         }
         let lower = comp.lowercased()
         if lower == "googleservice-info.plist" || lower == "google-services.json" {
+            return true
+        }
+        if lower == "release.apk" || lower.hasSuffix("-release.apk") || lower.hasSuffix("_release.apk") {
             return true
         }
         if comp.hasPrefix(".env.") {
@@ -257,11 +342,23 @@ public struct SafetyValidator: Sendable {
             standardized = String(standardized.dropLast())
         }
 
-        if standardized == "/" ||
-           standardized == homeDirectory ||
-           standardized == "\(homeDirectory)/Library" ||
-           standardized == "\(homeDirectory)/Library/Caches" ||
-           standardized == "\(homeDirectory)/Library/Application Support" {
+        let protectedRoots: Set<String> = [
+            "/",
+            homeDirectory,
+            "\(homeDirectory)/Library",
+            "\(homeDirectory)/Library/Caches",
+            "\(homeDirectory)/Library/Application Support",
+            "\(homeDirectory)/Library/Developer",
+            "\(homeDirectory)/Library/Containers",
+            "\(homeDirectory)/Library/Logs",
+            "\(homeDirectory)/.cache",
+            "\(homeDirectory)/.npm",
+            "\(homeDirectory)/.gradle",
+            "\(homeDirectory)/.android",
+            "\(homeDirectory)/Library/Android",
+            "\(homeDirectory)/Library/Android/sdk"
+        ]
+        if protectedRoots.contains(standardized) {
             throw SafetyError.forbiddenProtectedPath(standardized)
         }
 
@@ -299,15 +396,28 @@ public struct SafetyValidator: Sendable {
             throw SafetyError.notInExplicitAllowList(normalized)
         }
 
-        // 5. Explicitly block manual deletion of Claude/Codex root or session files
-        let claudeRoot = "\(homeDirectory)/Library/Application Support/Claude"
-        let codexRoot = "\(homeDirectory)/Library/Application Support/Codex"
-        if normalized == claudeRoot || normalized == codexRoot {
+        // 5. Explicitly block manual deletion of whole Application Support app roots
+        let protectedAppSupportRoots: Set<String> = [
+            "\(homeDirectory)/Library/Application Support/Claude",
+            "\(homeDirectory)/Library/Application Support/Codex",
+            "\(homeDirectory)/Library/Application Support/Code",
+            "\(homeDirectory)/Library/Application Support/Antigravity",
+            "\(homeDirectory)/Library/Application Support/Cursor",
+            "\(homeDirectory)/Library/Application Support/Notion",
+            "\(homeDirectory)/Library/Application Support/Google",
+            "\(homeDirectory)/Library/Application Support/OutSystems",
+            "\(homeDirectory)/.cache/firebase"
+        ]
+        if protectedAppSupportRoots.contains(normalized) {
             throw SafetyError.forbiddenProtectedPath(normalized)
         }
 
-        // 6. Check explicit allow-list
-        let isAllowed = allowedRootPrefixes.contains { allowed in
+        // 6. Check explicit allow-list (or verified .litertlm model file in ~/Library/Caches)
+        let isLitertlmInCaches: Bool = {
+            let parent = URL(fileURLWithPath: normalized).deletingLastPathComponent().path
+            return parent == "\(homeDirectory)/Library/Caches" && normalized.lowercased().hasSuffix(".litertlm")
+        }()
+        let isAllowed = isLitertlmInCaches || allowedRootPrefixes.contains { allowed in
             normalized == allowed || normalized.hasPrefix(allowed + "/")
         }
         guard isAllowed else {
@@ -330,6 +440,18 @@ public struct SafetyValidator: Sendable {
         }
 
         return normalized
+    }
+
+    public func validateNotModifiedSinceScan(_ validatedPath: String, expectedModifiedAt: Date?) throws {
+        guard let expectedModifiedAt, FileManager.default.fileExists(atPath: validatedPath) else {
+            return
+        }
+        let url = URL(fileURLWithPath: validatedPath)
+        if let modVals = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+           let currentMod = modVals.contentModificationDate,
+           currentMod.timeIntervalSince(expectedModifiedAt) > 2.0 {
+            throw SafetyError.modifiedSinceScan(validatedPath)
+        }
     }
 
     private func isPermittedDerivedArtifactComponent(name: String, fullPath: String) -> Bool {

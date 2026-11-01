@@ -113,6 +113,7 @@ public struct CleanupExecutor: Sendable {
 
         case .moveToTrash(let rawPath):
             let validatedPath = try validator.validateForDeletion(rawPath)
+            try validator.validateNotModifiedSinceScan(validatedPath, expectedModifiedAt: item.lastModified)
             try validator.validateSubtreeForDeletion(validatedPath)
             guard FileManager.default.fileExists(atPath: validatedPath) else {
                 return CleanupResult(
@@ -256,6 +257,8 @@ public struct CleanupExecutor: Sendable {
             for entry in plan.eligibleEntries {
                 // Re-validate immediately prior to trashing each eligible child
                 let childValidated = try validator.validateForDeletion(entry.path)
+                let expectedChildMod = item.plan?.entries.first(where: { $0.path == entry.path })?.lastModified ?? item.lastModified
+                try validator.validateNotModifiedSinceScan(childValidated, expectedModifiedAt: expectedChildMod)
                 try validator.validateSubtreeForDeletion(childValidated)
                 try trashHandler(URL(fileURLWithPath: childValidated))
                 movedBytes += entry.physicalBytes

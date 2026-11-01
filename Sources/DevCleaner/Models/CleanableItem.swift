@@ -235,6 +235,7 @@ public struct CleanupBatchSummary: Equatable, Sendable {
 
 public struct SimulatorMetadata: Codable, Equatable, Sendable {
     public let udid: String
+    public let deviceModel: String
     public let runtimeName: String
     public let state: String
     public let isAvailable: Bool
@@ -245,6 +246,7 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
 
     public init(
         udid: String,
+        deviceModel: String = "",
         runtimeName: String,
         state: String,
         isAvailable: Bool,
@@ -254,6 +256,7 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
         isFavorite: Bool = false
     ) {
         self.udid = udid
+        self.deviceModel = deviceModel
         self.runtimeName = runtimeName
         self.state = state
         self.isAvailable = isAvailable
@@ -279,6 +282,19 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
         }
         return state.uppercased()
     }
+
+    public var recommendationBadgeText: String {
+        if !isAvailable {
+            return "UNAVAILABLE"
+        }
+        if isBooted || isFavorite {
+            return "KEEP"
+        }
+        if let lastUsedAt, Date().timeIntervalSince(lastUsedAt) <= 14 * 86400 {
+            return "KEEP"
+        }
+        return "REVIEW"
+    }
 }
 
 public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
@@ -290,6 +306,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
     public let physicalSize: Int64
     public let reclaimableSize: Int64
     public let lastModified: Date?
+    public let lastUsed: Date?
     public let riskLevel: RiskLevel
     public let explanation: String
     public let deletionConsequence: String
@@ -312,6 +329,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         physicalSize: Int64,
         reclaimableSize: Int64,
         lastModified: Date?,
+        lastUsed: Date? = nil,
         riskLevel: RiskLevel,
         explanation: String,
         deletionConsequence: String,
@@ -333,6 +351,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         self.physicalSize = physicalSize
         self.reclaimableSize = reclaimableSize
         self.lastModified = lastModified
+        self.lastUsed = lastUsed
         self.riskLevel = riskLevel
         self.explanation = explanation
         self.deletionConsequence = deletionConsequence
@@ -345,6 +364,16 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
         self.plan = plan
         self.requiresRedownload = requiresRedownload
         self.affectsSessionsOrConfig = affectsSessionsOrConfig
+    }
+
+    public var usageDateDescription: String {
+        if let used = lastUsed ?? simulatorMetadata?.lastUsedAt {
+            return "Last used: \(Formatters.relativeDate(used))"
+        }
+        if let mod = lastModified {
+            return "Last modified: \(Formatters.relativeDate(mod))"
+        }
+        return "Usage unknown"
     }
 
     public var canBeSelected: Bool {

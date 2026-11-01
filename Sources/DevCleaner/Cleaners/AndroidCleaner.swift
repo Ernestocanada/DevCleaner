@@ -65,7 +65,7 @@ public struct AndroidCleaner: CleanerProvider {
                 }
             }
 
-            // 1b. System Images (~/Library/Android/sdk/system-images) -> NEVER DELETE automatically
+            // 1b. System Images (~/Library/Android/sdk/system-images) -> REVIEW / manage through SDK Manager (never delete manually)
             let sysImagesPath = "\(sdkPath)/system-images"
             if FileManager.default.fileExists(atPath: sysImagesPath) {
                 sdkExcluded.insert(URL(fileURLWithPath: sysImagesPath).standardizedFileURL.path)
@@ -76,20 +76,20 @@ public struct AndroidCleaner: CleanerProvider {
                     items.append(
                         CleanableItem(
                             id: "android-system-images-keep",
-                            name: "Android System Images (\(versions.isEmpty ? "system-images" : versions.joined(separator: ", ")))",
+                            name: "Android System Images (\(versions.isEmpty ? "system-images" : versions.joined(separator: ", "))) — Manage via SDK Manager",
                             category: .android,
                             path: sysImagesPath,
                             logicalSize: sysUsage.logicalSize,
                             physicalSize: sysUsage.physicalSize,
                             reclaimableSize: 0,
                             lastModified: sysUsage.lastModified,
-                            riskLevel: .neverDelete,
-                            explanation: "Installed Android Emulator system images.\(versionNote)",
-                            deletionConsequence: "Protected: Never deleted automatically. Use Android Studio SDK Manager (`sdkmanager`) to manage system images.",
+                            riskLevel: .review,
+                            explanation: "Installed Android Emulator system images.\(versionNote) Manage through Android Studio SDK Manager (`sdkmanager`). Never deleted manually by DevCleaner.",
+                            deletionConsequence: "Read-only / Review: Never deleted manually. Use Android Studio SDK Manager (`sdkmanager`) to remove unused system images.",
                             regenerationImpact: "Re-downloading a system image requires a 1.5–3 GB download.",
                             isRunningDependency: isEmulatorRunning,
                             runningProcessNames: runningProcs,
-                            actionType: .readOnlyInfo(reason: "Android system images are preserved; manage via Android Studio SDK Manager."),
+                            actionType: .readOnlyInfo(reason: "Android system images are managed via Android Studio SDK Manager (`sdkmanager`)."),
                             requiresRedownload: true
                         )
                     )

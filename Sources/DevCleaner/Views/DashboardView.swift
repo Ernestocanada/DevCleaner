@@ -46,6 +46,8 @@ public struct DashboardView: View {
                 ProjectStorageAnalyzerView(viewModel: viewModel)
             case .worktrees:
                 WorktreeAnalyzerView(viewModel: viewModel)
+            case .macStorage:
+                MacStorageAnalyzerView(viewModel: viewModel)
             }
 
             Divider()
@@ -96,6 +98,12 @@ public struct DashboardView: View {
                         } else if tab == .worktrees && !viewModel.worktreeRecords.isEmpty {
                             let wtBytes = viewModel.worktreeRecords.reduce(Int64(0)) { $0 + $1.physicalBytes }
                             Text("\(viewModel.worktreeRecords.count) • \(Formatters.bytes(wtBytes))")
+                                .font(.caption2.monospacedDigit())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(isSelected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.15)))
+                        } else if tab == .macStorage && viewModel.macStorageSummary.totalDeveloperStorageBytes > 0 {
+                            Text(Formatters.bytes(viewModel.macStorageSummary.totalDeveloperStorageBytes))
                                 .font(.caption2.monospacedDigit())
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
@@ -349,10 +357,10 @@ In Trash shows items in ~/.Trash waiting to be permanently emptied.
                 Button {
                     Task { await viewModel.performScan() }
                 } label: {
-                    Label(viewModel.isScanning ? "Scanning..." : "Scan Now", systemImage: "arrow.clockwise")
+                    Label(viewModel.isScanning ? "Scan Again" : "Scan Now", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
-                .disabled(viewModel.isScanning || viewModel.isCleaning)
+                .disabled(viewModel.isCleaning)
 
                 Button {
                     viewModel.selectRecommendedSafeItems()
@@ -648,6 +656,31 @@ public struct CleanableItemRow: View {
                             )
                             .cornerRadius(4)
 
+                        Text(sim.recommendationBadgeText)
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                sim.recommendationBadgeText == "KEEP"
+                                    ? Color.green.opacity(0.15)
+                                    : (sim.recommendationBadgeText == "REVIEW" ? Color.orange.opacity(0.15) : Color.secondary.opacity(0.15))
+                            )
+                            .foregroundColor(
+                                sim.recommendationBadgeText == "KEEP"
+                                    ? .green
+                                    : (sim.recommendationBadgeText == "REVIEW" ? .orange : .secondary)
+                            )
+                            .cornerRadius(4)
+
+                        if !item.name.contains(sim.deviceModel) {
+                            Text("Model: \(sim.deviceModel)")
+                                .font(.system(size: 10))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.secondary.opacity(0.1)))
+                                .foregroundStyle(.secondary)
+                        }
+
                         if !sim.installedAppNames.isEmpty {
                             Text("\(sim.installedAppNames.count) app\(sim.installedAppNames.count == 1 ? "" : "s") installed")
                                 .font(.system(size: 10, weight: .semibold))
@@ -725,11 +758,9 @@ public struct CleanableItemRow: View {
                                 .foregroundColor(.secondary)
                         }
 
-                        if let mod = item.lastModified {
-                            Text("Last activity: \(Formatters.relativeDate(mod))")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
+                        Text(item.usageDateDescription)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                     }
                 }
 

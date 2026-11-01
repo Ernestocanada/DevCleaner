@@ -392,7 +392,7 @@ final class ProjectAndWorktreeAnalyzerTests: XCTestCase {
         let oldVersion = try XCTUnwrap(claudeItems.first { $0.id == "claude-code-old-2.1.304" })
         let activeVersion = try XCTUnwrap(claudeItems.first { $0.id == "claude-code-active-2.1.308" })
 
-        XCTAssertEqual(oldVersion.riskLevel, .review)
+        XCTAssertEqual(oldVersion.riskLevel, .safe, "Superseded Claude Code version verified by .sdk-version must be classified as SAFE")
         XCTAssertGreaterThan(oldVersion.reclaimableSize, 0)
         XCTAssertEqual(activeVersion.riskLevel, .neverDelete)
         XCTAssertEqual(activeVersion.reclaimableSize, 0)
@@ -411,7 +411,7 @@ final class ProjectAndWorktreeAnalyzerTests: XCTestCase {
         // Verify exact tab labels required by UI specification
         XCTAssertEqual(
             MainAnalyzerTab.allCases.map(\.rawValue),
-            ["System & Tools", "Project Storage", "Worktrees"]
+            ["System & Tools", "Project Storage", "Worktrees", "Mac Storage"]
         )
 
         let delegate = DevCleanerAppDelegate()

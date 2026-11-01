@@ -183,7 +183,8 @@ public struct DevCleanerApp: App {
             proc.arguments = ["-a", bundlePath]
             try? proc.run()
             proc.waitUntilExit()
-        } else {
+        }
+        if !(appDelegate.mainWindow ?? window).isVisible {
             _ = appDelegate.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: false)
         }
         try? await Task.sleep(nanoseconds: 500_000_000)
@@ -206,7 +207,7 @@ public struct DevCleanerApp: App {
         let primaryWindowCount2 = NSApplication.shared.windows.filter { !($0 is NSPanel) && $0.className != "NSStatusBarWindow" && $0.isVisible }.count
         print("5. After Second OS Dock Reopen Event (No Duplicates Check): visiblePrimaryWindows=\(primaryWindowCount2)")
 
-        let success = initialVisible && !visibleAfterClose && visibleAfterReopen && primaryWindowCount1 == 1 && primaryWindowCount2 == 1 && tabs == ["System & Tools", "Project Storage", "Worktrees"]
+        let success = initialVisible && !visibleAfterClose && visibleAfterReopen && primaryWindowCount1 == 1 && primaryWindowCount2 == 1 && tabs == ["System & Tools", "Project Storage", "Worktrees", "Mac Storage"]
         print("DOCK_REOPEN_VERIFICATION=\(success ? "PASSED" : "FAILED")")
         exit(success ? 0 : 1)
     }
@@ -227,9 +228,10 @@ public struct DevCleanerApp: App {
         let projectSummary = await MainActor.run { vm.projectSummary }
         let projectReports = await MainActor.run { vm.projectReports }
         let worktreeRecords = await MainActor.run { vm.worktreeRecords }
+        let macSummary = await MainActor.run { vm.macStorageSummary }
 
         print("=================================================================")
-        print("DevCleaner Read-Only Scan Report (v2.0 Project & Worktree Analyzer)")
+        print("DevCleaner Read-Only Scan Report (v3.0 Developer Mac Storage Manager)")
         print("macOS Available:                   \(Formatters.bytes(macOSAvailable))")
         print("Physical Free:                     \(Formatters.bytes(physicalFree))")
         print("Purgeable Space:                   \(Formatters.bytes(purgeable))")
@@ -240,6 +242,31 @@ public struct DevCleanerApp: App {
         print("  - CAUTION potential:             \(Formatters.bytes(cautionAllAges))")
         print("Recommended Cleanup (SAFE Only):   \(Formatters.bytes(recommendedAllAges))")
         print("=================================================================")
+
+        print("\n[MAC STORAGE GLOBAL SUMMARY — Deduplicated]")
+        print("  Total Developer Storage:         \(Formatters.bytes(macSummary.totalDeveloperStorageBytes))")
+        print("  SAFE Cleanup:                    \(Formatters.bytes(macSummary.safeCleanupBytes))")
+        print("  REVIEW Cleanup:                  \(Formatters.bytes(macSummary.reviewCleanupBytes))")
+        print("  PROTECTED Storage:               \(Formatters.bytes(macSummary.protectedBytes))")
+        print("  --- Domain Breakdown (Section 12) ---")
+        print("  • Developer Projects:            \(Formatters.bytes(macSummary.developerProjectsBytes))")
+        print("  • AI Tools:                      \(Formatters.bytes(macSummary.aiToolsBytes))")
+        print("  • Simulators:                    \(Formatters.bytes(macSummary.simulatorsBytes))")
+        print("  • Docker:                        \(Formatters.bytes(macSummary.dockerBytes))")
+        print("  • Android SDK:                   \(Formatters.bytes(macSummary.androidSDKBytes))")
+        print("  • Caches:                        \(Formatters.bytes(macSummary.cachesBytes))")
+        print("  • Other Developer Data:          \(Formatters.bytes(macSummary.otherDeveloperDataBytes))")
+        print("  --- Inspected Roots ---")
+        for root in macSummary.inspectedRoots {
+            print("  • \(root.displayPath): \(Formatters.bytes(root.physicalBytes)) (SAFE: \(Formatters.bytes(root.safeReclaimableBytes)) | REVIEW: \(Formatters.bytes(root.reviewReclaimableBytes)) | Protected: \(Formatters.bytes(root.protectedBytes)))")
+        }
+        print("  --- Mac Storage Categories ---")
+        for grp in macSummary.categoryGroups {
+            print("  * [\(grp.category.rawValue)] Total: \(Formatters.bytes(grp.totalPhysicalBytes)) | SAFE: \(Formatters.bytes(grp.safeReclaimableBytes)) | REVIEW: \(Formatters.bytes(grp.reviewReclaimableBytes)) | Protected: \(Formatters.bytes(grp.protectedBytes))")
+            for item in grp.items {
+                print("      - [\(item.riskLevel.rawValue)] \(item.name): \(Formatters.bytes(item.physicalSize)) -> Potential: \(Formatters.bytes(item.reclaimableSize)) (\(item.usageDateDescription))")
+            }
+        }
 
         print("\n[PROJECT STORAGE ANALYZER SUMMARY — \(projectSummary.rootDirectoryPath)]")
         print("  Total Projects Count:            \(projectSummary.totalProjectsCount)")

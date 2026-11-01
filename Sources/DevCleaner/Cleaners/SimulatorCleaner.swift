@@ -58,6 +58,7 @@ public struct SimulatorCleaner: CleanerProvider {
         let name: String
         let state: String
         let isAvailable: Bool?
+        let deviceTypeIdentifier: String?
         let dataPath: String?
         let dataPathSize: Int64?
         let logPath: String?
@@ -155,6 +156,17 @@ public struct SimulatorCleaner: CleanerProvider {
         return key
     }
 
+    public static func formatDeviceTypeIdentifier(_ identifier: String?, fallbackName: String) -> String {
+        guard let identifier, !identifier.isEmpty else {
+            return fallbackName
+        }
+        if let range = identifier.range(of: "SimDeviceType.") {
+            let suffix = String(identifier[range.upperBound...])
+            return suffix.replacingOccurrences(of: "-", with: " ")
+        }
+        return fallbackName
+    }
+
     public static func detectInstalledApps(inDataPath dataPath: String) -> [String] {
         let fm = FileManager.default
         let appsRoot = URL(fileURLWithPath: dataPath).appendingPathComponent("Containers/Bundle/Application")
@@ -208,9 +220,11 @@ public struct SimulatorCleaner: CleanerProvider {
                 let installedApps = detectInstalledApps(inDataPath: devicePath)
                 let hasLocalData = !installedApps.isEmpty || size > 100 * 1024 * 1024
                 let isFavorite = favoriteUDIDs.contains(dev.udid)
+                let modelLabel = formatDeviceTypeIdentifier(dev.deviceTypeIdentifier, fallbackName: dev.name)
 
                 let meta = SimulatorMetadata(
                     udid: dev.udid,
+                    deviceModel: modelLabel,
                     runtimeName: runtimeLabel,
                     state: dev.state,
                     isAvailable: isAvailable,
@@ -227,6 +241,8 @@ public struct SimulatorCleaner: CleanerProvider {
                     if isFavorite { return "FAVORITE — protected" }
                     return isAvailable ? dev.state : "Unavailable / Orphaned"
                 }()
+
+                let availabilityText = isAvailable ? "Available" : "Unavailable"
 
                 let appsSummary: String = {
                     if !installedApps.isEmpty {
@@ -250,8 +266,9 @@ public struct SimulatorCleaner: CleanerProvider {
                         physicalSize: size,
                         reclaimableSize: reclaimable,
                         lastModified: lastUsed,
+                        lastUsed: lastUsed,
                         riskLevel: itemRisk,
-                        explanation: "Device: \(dev.name) • Runtime: \(runtimeLabel) • State: \(stateNote).\(appsSummary) Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
+                        explanation: "Model: \(modelLabel) • Device: \(dev.name) • Runtime: \(runtimeLabel) • State: \(stateNote) (\(availabilityText)) • Recommendation: \(meta.recommendationBadgeText).\(appsSummary) Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
                         deletionConsequence: "Deletes this simulator device and its app sandbox data via official 'xcrun simctl delete \(dev.udid)'.",
                         regenerationImpact: "Simulator device can be recreated in Xcode if needed; installed simulator apps will need a fresh build.",
                         isRunningDependency: isBooted,
