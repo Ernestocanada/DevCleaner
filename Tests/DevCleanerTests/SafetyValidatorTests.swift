@@ -94,6 +94,10 @@ final class SafetyValidatorTests: XCTestCase {
             "~/Library/Application Support/Claude/config.json",
             "~/Library/Application Support/Claude/side-session-notes",
             "~/Library/Application Support/Claude/Local Storage",
+            "~/Library/Application Support/Claude/vm_bundles",
+            "~/Library/Application Support/Claude/vm_bundles/claudevm.bundle",
+            "~/Library/Application Support/Claude/vm_bundles/claudevm.bundle/rootfs.img",
+            "~/Library/Application Support/Claude/vm_bundles/claudevm.bundle/sessiondata.img",
             "~/Library/Application Support/Codex",
             "~/Library/Application Support/Codex/artifact-sessions",
             "~/Library/Application Support/Codex/Cookies",
@@ -103,7 +107,7 @@ final class SafetyValidatorTests: XCTestCase {
         for path in sessionPaths {
             XCTAssertFalse(
                 validator.isSafeToDelete(path, checkSymlinksOnDisk: false),
-                "Session/config path must be rejected: \(path)"
+                "Session/config/VM bundle path must be rejected: \(path)"
             )
         }
     }
@@ -160,7 +164,6 @@ final class SafetyValidatorTests: XCTestCase {
             "~/Library/Application Support/Claude/Cache",
             "~/Library/Application Support/Claude/Code Cache",
             "~/Library/Application Support/Claude/simulator-builds",
-            "~/Library/Application Support/Claude/vm_bundles",
             "~/Library/Application Support/com.google.AIEdgeForesight/models",
             "~/Library/Application Support/com.google.AIEdgeForesight/model_cache"
         ]
@@ -201,7 +204,9 @@ final class SafetyValidatorTests: XCTestCase {
             "~/.npm/_cacache/credentials_prod.json",
             "~/.gradle/caches/client_secret_123.json",
             "~/.gradle/caches/client_secret.json",
-            "~/.npm/_npx/.env"
+            "~/.npm/_npx/.env",
+            "~/.npm/.npmrc",
+            "~/.npm/_cacache/.npmrc"
         ]
 
         for path in sensitiveCredentialPaths {

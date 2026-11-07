@@ -34,8 +34,11 @@ public struct CleanupExecutor: Sendable {
     public let freeSpaceProvider: @Sendable () -> Int64
     public let processChecker: @Sendable (CleanerCategory) async -> [String]
     public let trashHandler: @Sendable (URL) throws -> Void
+    public let reversibleTrashHandler: @Sendable (URL) throws -> URL?
     public let shellRunner: @Sendable (String, [String]) async -> ShellResult
     public let avdManagerResolver: @Sendable () -> String?
+    public let npmCapabilitiesProvider: @Sendable () async -> NpmCapabilities
+    public let npmLiveUseChecker: @Sendable (String) async -> NpmLiveUseState
 
     public init(
         validator: SafetyValidator = SafetyValidator(),
@@ -44,21 +47,52 @@ public struct CleanupExecutor: Sendable {
             let snapshot = await ProcessMonitor.shared.captureSnapshot()
             return snapshot.matchingProcesses(for: category)
         },
-        trashHandler: @escaping @Sendable (URL) throws -> Void = { url in
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-        },
+        trashHandler: (@Sendable (URL) throws -> Void)? = nil,
+        reversibleTrashHandler: (@Sendable (URL) throws -> URL?)? = nil,
         shellRunner: @escaping @Sendable (String, [String]) async -> ShellResult = { executable, arguments in
             await ShellRunner.shared.run(executable, arguments: arguments)
         },
-        avdManagerResolver: (@Sendable () -> String?)? = nil
+        avdManagerResolver: (@Sendable () -> String?)? = nil,
+        npmCapabilitiesProvider: (@Sendable () async -> NpmCapabilities)? = nil,
+        npmLiveUseChecker: (@Sendable (String) async -> NpmLiveUseState)? = nil
     ) {
         self.validator = validator
         self.freeSpaceProvider = freeSpaceProvider
         self.processChecker = processChecker
-        self.trashHandler = trashHandler
+        if let reversibleTrashHandler {
+            self.reversibleTrashHandler = reversibleTrashHandler
+            self.trashHandler = trashHandler ?? { url in _ = try reversibleTrashHandler(url) }
+        } else if let trashHandler {
+            self.trashHandler = trashHandler
+            self.reversibleTrashHandler = { url in
+                try trashHandler(url)
+                return nil
+            }
+        } else {
+            let defaultReversible: @Sendable (URL) throws -> URL? = { url in
+                var resulting: NSURL?
+                try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
+                return resulting as URL?
+            }
+            self.reversibleTrashHandler = defaultReversible
+            self.trashHandler = { url in _ = try defaultReversible(url) }
+        }
         self.shellRunner = shellRunner
         self.avdManagerResolver = avdManagerResolver ?? {
             AndroidCleaner.resolveAVDManagerBinary(homeDirectory: validator.homeDirectory)
+        }
+        let homeDir = validator.homeDirectory
+        self.npmCapabilitiesProvider = npmCapabilitiesProvider ?? {
+            await NpmCacheInspector.discoverCapabilities(homeDirectory: homeDir, shellRunner: shellRunner)
+        }
+        self.npmLiveUseChecker = npmLiveUseChecker ?? { cacheRoot in
+            let snapshot = await ProcessMonitor.shared.captureSnapshot()
+            return await NpmCacheInspector.inspectLiveUse(
+                cacheRoot: cacheRoot,
+                snapshot: snapshot,
+                shellRunner: shellRunner,
+                includeSystemQueries: true
+            )
         }
     }
 
@@ -194,6 +228,125 @@ public struct CleanupExecutor: Sendable {
                 message: "Moved verified project artifact to macOS Trash (\(Formatters.bytes(movedBytes))). Empty Trash to recover disk space."
             )
 
+        case .moveToTrashVerifiedWorktreeArtifact(let rawPath, let worktreeRoot, let sourceRepoRoot, let expectedModifiedAt):
+            // 1. Only SAFE worktree artifacts can be deleted
+            guard item.riskLevel == .safe else {
+                throw CleanerError.readOnlyItem("Worktree artifact '\(item.name)' is classified as \(item.riskLevel.rawValue) and cannot be deleted automatically.")
+            }
+
+            let normalizedWorktreeRoot = try validator.expandAndNormalize(worktreeRoot)
+
+            // 2. Verify worktree Git metadata immediately before touching anything
+            let wtVerification = SafetyValidator.verifyWorktreeGitMetadata(at: normalizedWorktreeRoot)
+            guard wtVerification.isVerified else {
+                throw SafetyError.unverifiedWorktree(normalizedWorktreeRoot)
+            }
+
+            // 3. Refresh git status --porcelain immediately before destructive operation
+            let statusBefore = await shellRunner("/usr/bin/git", ["-C", normalizedWorktreeRoot, "status", "--porcelain"])
+            guard statusBefore.isSuccess else {
+                throw CleanerError.commandFailed("Unable to verify git status before cleaning worktree artifact.")
+            }
+            let parsedBefore = GitWorktreeAnalyzer.parseGitStatusPorcelainBranch(statusBefore.stdout, isDetached: false)
+            if parsedBefore.modifiedCount > 0 || parsedBefore.stagedCount > 0 {
+                throw CleanerError.readOnlyItem("Worktree has uncommitted tracked changes; refusing to clean artifact.")
+            }
+
+            // 4. Rerun full SafetyValidator pre-deletion check (canonical path containment, path identity, symlink escape, .env/db/cert/release protection, mtime check)
+            let validatedPath = try validator.validateVerifiedWorktreeArtifactForDeletion(
+                rawPath,
+                worktreeRoot: worktreeRoot,
+                sourceRepoRoot: sourceRepoRoot,
+                expectedModifiedAt: expectedModifiedAt,
+                checkSymlinksOnDisk: true
+            )
+            let relativePath = String(validatedPath.dropFirst(normalizedWorktreeRoot.count + 1))
+
+            // 5. Refresh tracked and Git-ignored state immediately before trashing
+            let lsRes = await shellRunner("/usr/bin/git", ["-C", normalizedWorktreeRoot, "ls-files", "--", relativePath])
+            let hasTracked = lsRes.stdout
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .contains { !$0.isEmpty && ($0 == relativePath || $0.hasPrefix(relativePath + "/")) }
+            if !lsRes.isSuccess || hasTracked {
+                throw SafetyError.forbiddenFileOrComponent(validatedPath)
+            }
+
+            let visibleUntrackedBefore = GitWorktreeAnalyzer.extractUntrackedPaths(fromPorcelainStatus: statusBefore.stdout).contains { rawUntracked in
+                let cleaned = rawUntracked.hasSuffix("/") ? String(rawUntracked.dropLast()) : rawUntracked
+                return cleaned == relativePath || cleaned.hasPrefix(relativePath + "/") || relativePath.hasPrefix(cleaned + "/")
+            }
+            let ignoreRes = await shellRunner("/usr/bin/git", ["-C", normalizedWorktreeRoot, "check-ignore", "-q", "--", relativePath])
+            if ignoreRes.exitCode != 0 || visibleUntrackedBefore {
+                throw CleanerError.readOnlyItem("Worktree artifact '\(relativePath)' is not confirmed Git-ignored (Git: untracked); refusing automatic deletion.")
+            }
+
+            guard FileManager.default.fileExists(atPath: validatedPath) else {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
+            }
+
+            let beforeUsage = DiskScanner.shared.measurePath(validatedPath)
+            let url = URL(fileURLWithPath: validatedPath)
+            let trashedURL = try reversibleTrashHandler(url)
+            let movedBytes = beforeUsage.physicalSize > 0 ? beforeUsage.physicalSize : item.reclaimableSize
+
+            // 6. Fail closed: compare git status after moving artifact to Trash
+            let statusAfter = await shellRunner("/usr/bin/git", ["-C", normalizedWorktreeRoot, "status", "--porcelain"])
+            let statusPreserved = statusAfter.isSuccess && (statusBefore.stdout == statusAfter.stdout)
+
+            if !statusPreserved {
+                let rollbackOutcome = GitWorktreeAnalyzer.attemptTrashRollback(
+                    trashedURL: trashedURL,
+                    originalPath: validatedPath
+                )
+                let failureMessage: String
+                switch rollbackOutcome {
+                case .restored:
+                    failureMessage = "Cleanup failed & rolled back: Git status changed unexpectedly after trashing '\(relativePath)'. Artifact was automatically restored to '\(validatedPath)'."
+                case .destinationAlreadyExists(let trashPath):
+                    let loc = trashPath ?? "macOS Trash"
+                    failureMessage = "CAUTION — Git status changed unexpectedly after trashing '\(relativePath)'. Rollback was aborted because '\(validatedPath)' already exists on disk (never overwritten). The artifact remains in Trash at \(loc)."
+                case .failedToRestore(let trashPath, let errDesc):
+                    let loc = trashPath ?? "macOS Trash"
+                    failureMessage = "CAUTION — Git status changed unexpectedly after trashing '\(relativePath)' and automatic restoration failed (\(errDesc)). The artifact remains in Trash at \(loc)."
+                }
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .failed,
+                    message: failureMessage
+                )
+            }
+
+            if movedBytes == 0 {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .moveToTrash,
+                    status: .nothingEligible,
+                    message: "Nothing eligible for cleanup."
+                )
+            }
+
+            return CleanupResult(
+                processedBytes: movedBytes,
+                movedToTrashBytes: movedBytes,
+                actuallyFreedBytes: 0,
+                action: .moveToTrash,
+                status: .cleaned,
+                message: "Moved verified Git-ignored worktree artifact to macOS Trash (\(Formatters.bytes(movedBytes))). Git status verified unchanged."
+            )
+
         case .moveToTrashContents(let directoryPath, let fixedAge):
             let validatedDir = try validator.validateForDeletion(directoryPath)
             guard FileManager.default.fileExists(atPath: validatedDir) else {
@@ -292,6 +445,17 @@ public struct CleanupExecutor: Sendable {
                 throw CleanerError.commandFailed("Invalid Simulator UDID: \(udid)")
             }
 
+            // If Xcode developer directory was recorded at scan time, revalidate `xcode-select -p` immediately before execution
+            if let expectedXcodeDir = item.simulatorMetadata?.xcodeDeveloperDir, !expectedXcodeDir.isEmpty {
+                let xcodeRes = await shellRunner("/usr/bin/xcode-select", ["-p"])
+                let currentXcodeDir = xcodeRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !xcodeRes.isSuccess || currentXcodeDir != expectedXcodeDir {
+                    throw CleanerError.commandFailed(
+                        "Active Xcode selection changed since scan (expected '\(expectedXcodeDir)', found '\(currentXcodeDir)'). Re-scan before deleting simulator \(udid)."
+                    )
+                }
+            }
+
             // Re-query simctl immediately before deletion — never infer state from earlier UI scan
             let listRes = await shellRunner("/usr/bin/xcrun", ["simctl", "list", "devices", "-j"])
             guard listRes.isSuccess, let listData = listRes.stdout.data(using: .utf8) else {
@@ -317,6 +481,32 @@ public struct CleanupExecutor: Sendable {
                 )
             }
 
+            // Revalidate exact UDID, runtime, availability, and QA/favorite protection against scan-time metadata
+            if let meta = item.simulatorMetadata {
+                if meta.isFavorite {
+                    throw CleanerError.readOnlyItem("Simulator '\(item.name)' is marked as Favorite and protected from deletion.")
+                }
+                if !meta.runtimeIdentifier.isEmpty &&
+                   !targetDevice.runtimeIdentifier.isEmpty &&
+                   meta.runtimeIdentifier != targetDevice.runtimeIdentifier {
+                    throw CleanerError.commandFailed(
+                        "Simulator \(udid) runtime changed since scan (\(meta.runtimeIdentifier) -> \(targetDevice.runtimeIdentifier)). Re-scan before deleting."
+                    )
+                }
+                if meta.isAvailable != targetDevice.isAvailable {
+                    throw CleanerError.commandFailed(
+                        "Simulator \(udid) availability changed since scan (isAvailable: \(meta.isAvailable) -> \(targetDevice.isAvailable)). Re-scan before deleting."
+                    )
+                }
+                let liveIsQADevice = SimulatorMetadata.isQADeviceName(targetDevice.name)
+                if liveIsQADevice && !meta.isNamedQADevice {
+                    throw CleanerError.commandFailed(
+                        "Simulator \(udid) was renamed to QA/protected device '\(targetDevice.name)' since scan. Re-scan before deleting."
+                    )
+                }
+            }
+
+            // Strictly require Shutdown state (blocks Booted, Creating, Shutting Down, Booting, etc.)
             guard targetDevice.isShutdown else {
                 let displayName = targetDevice.name.isEmpty ? item.name : targetDevice.name
                 throw CleanerError.simulatorDeviceActive(deviceName: displayName, state: targetDevice.state)
@@ -338,22 +528,8 @@ public struct CleanupExecutor: Sendable {
             )
 
         case .simctlDeleteUnavailable:
-            let res = await shellRunner("/usr/bin/xcrun", ["simctl", "delete", "unavailable"])
-            if !res.isSuccess {
-                throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
-            }
-            let freeAfter = freeSpaceProvider()
-            let freedDelta = max(0, freeAfter - freeBefore)
-            let status: CleanupExecutionStatus = item.reclaimableSize > 0 ? .cleaned : .nothingEligible
-            return CleanupResult(
-                processedBytes: item.reclaimableSize,
-                movedToTrashBytes: 0,
-                actuallyFreedBytes: freedDelta,
-                action: .simctlDelete,
-                status: status,
-                message: item.reclaimableSize > 0
-                    ? "Removed unavailable simulators via simctl."
-                    : "Nothing eligible for cleanup (0 unavailable simulator bytes)."
+            throw CleanerError.readOnlyItem(
+                "Blanket deletion of unavailable simulators ('simctl delete unavailable') is disabled for safety. Select individual unavailable simulator devices for review."
             )
 
         case .simctlDeleteRuntime(let identifier):
@@ -425,6 +601,205 @@ public struct CleanupExecutor: Sendable {
                 status: .cleaned,
                 message: "Executed docker \(subcommand.joined(separator: " "))."
             )
+
+        case .npmCacheCommand(let rawCacheRoot, let subcommand):
+            let validatedCacheRoot = try NpmCacheInspector.validateAndCanonicalizeCacheRoot(
+                rawCacheRoot,
+                homeDirectory: validator.homeDirectory
+            )
+            let liveUse = await npmLiveUseChecker(validatedCacheRoot)
+            if liveUse.hasAnyGlobalOrNpxUse {
+                throw CleanerError.runningProcessActive(
+                    appName: liveUse.primaryProcessLabel(),
+                    categoryName: item.category.rawValue
+                )
+            }
+            let caps = await npmCapabilitiesProvider()
+            guard let npmBin = caps.npmBinaryPath, !npmBin.isEmpty else {
+                throw CleanerError.commandFailed("Cleanup blocked: official 'npm' CLI was not found.")
+            }
+            let cacacheDir = "\(validatedCacheRoot)/_cacache"
+            let scopedValidator = SafetyValidator(
+                homeDirectory: validator.homeDirectory,
+                additionalAllowedPrefixes: [cacacheDir, "\(validatedCacheRoot)/_npx", "\(validatedCacheRoot)/_logs"]
+            )
+            if FileManager.default.fileExists(atPath: cacacheDir) {
+                try scopedValidator.validateSubtreeForDeletion(cacacheDir)
+            }
+            let res = await shellRunner(npmBin, subcommand + ["--cache", validatedCacheRoot])
+            if !res.isSuccess {
+                throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
+            }
+            let freeAfter = freeSpaceProvider()
+            let freedDelta = max(0, freeAfter - freeBefore)
+            return CleanupResult(
+                processedBytes: item.reclaimableSize,
+                movedToTrashBytes: 0,
+                actuallyFreedBytes: freedDelta,
+                action: .npmCommand,
+                status: .cleaned,
+                message: "Executed npm \(subcommand.joined(separator: " ")) --cache \(validatedCacheRoot)."
+            )
+
+        case .npmNpxRemoveKeys(let rawCacheRoot, let keys):
+            guard !keys.isEmpty else {
+                return CleanupResult(
+                    processedBytes: 0,
+                    movedToTrashBytes: 0,
+                    actuallyFreedBytes: 0,
+                    action: .npmCommand,
+                    status: .nothingEligible,
+                    message: "No eligible npx keys to remove."
+                )
+            }
+            let validatedCacheRoot = try NpmCacheInspector.validateAndCanonicalizeCacheRoot(
+                rawCacheRoot,
+                homeDirectory: validator.homeDirectory
+            )
+            let caps = await npmCapabilitiesProvider()
+            guard caps.supportsSelectiveNpxRemoval, let npmBin = caps.npmBinaryPath, !npmBin.isEmpty else {
+                throw CleanerError.readOnlyItem("Installed npm does not support selective npx-cache removal.")
+            }
+            let liveUse = await npmLiveUseChecker(validatedCacheRoot)
+            if !liveUse.isDeterminedSafely || !liveUse.activeGlobalNpmProcesses.isEmpty ||
+               keys.contains(where: { liveUse.isNpxKeyActive($0) }) {
+                throw CleanerError.runningProcessActive(
+                    appName: liveUse.primaryProcessLabel(forKeys: keys),
+                    categoryName: item.category.rawValue
+                )
+            }
+            let npxRoot = "\(validatedCacheRoot)/_npx"
+            let scopedValidator = SafetyValidator(
+                homeDirectory: validator.homeDirectory,
+                additionalAllowedPrefixes: ["\(validatedCacheRoot)/_cacache", npxRoot, "\(validatedCacheRoot)/_logs"]
+            )
+            for key in keys {
+                guard !key.isEmpty && !key.contains("/") && key != "." && key != ".." else {
+                    throw SafetyError.containsParentTraversal(key)
+                }
+                let keyPath = "\(npxRoot)/\(key)"
+                if FileManager.default.fileExists(atPath: keyPath) {
+                    _ = try scopedValidator.validateForDeletion(keyPath)
+                    let expectedMod = item.plan?.entries.first(where: { $0.name == key })?.lastModified ?? item.lastModified
+                    try scopedValidator.validateNotModifiedSinceScan(keyPath, expectedModifiedAt: expectedMod)
+                    try scopedValidator.validateSubtreeForDeletion(keyPath)
+                }
+            }
+            let res = await shellRunner(npmBin, ["cache", "npx", "rm"] + keys + ["--cache", validatedCacheRoot])
+            if !res.isSuccess {
+                throw CleanerError.commandFailed(res.stderr.isEmpty ? res.stdout : res.stderr)
+            }
+            let freeAfter = freeSpaceProvider()
+            let freedDelta = max(0, freeAfter - freeBefore)
+            return CleanupResult(
+                processedBytes: item.reclaimableSize,
+                movedToTrashBytes: 0,
+                actuallyFreedBytes: freedDelta,
+                action: .npmCommand,
+                status: .cleaned,
+                message: "Removed inactive npx cache environment(s) (\(keys.joined(separator: ", "))) via npm cache npx rm."
+            )
         }
+    }
+
+    /// Authoritative batch execution helper for AI Worktree artifact candidates, delegating every destructive step through `execute(_:)`.
+    public func executeWorktreeCandidates(_ candidates: [WorktreeArtifactCandidate]) async -> WorktreeCleanupReport {
+        var cleanedPaths: [String] = []
+        var reclaimedBytes: Int64 = 0
+        var skippedItems: [WorktreeCleanupSkippedItem] = []
+        var rolledBackPaths: [String] = []
+        var failedItems: [WorktreeCleanupSkippedItem] = []
+        var gitStatusPreserved = true
+        var gitStatusDetails: [String: String] = [:]
+
+        for candidate in candidates {
+            guard candidate.classification == .safe, candidate.gitTrackingState == .ignored else {
+                skippedItems.append(
+                    WorktreeCleanupSkippedItem(
+                        path: candidate.fullPath,
+                        artifactName: candidate.relativePath,
+                        worktreeName: candidate.worktreeName,
+                        classification: candidate.classification,
+                        reason: candidate.classificationReason
+                    )
+                )
+                continue
+            }
+
+            let wtPath = URL(fileURLWithPath: candidate.worktreePath).standardizedFileURL.path
+            let artPath = URL(fileURLWithPath: candidate.fullPath).standardizedFileURL.path
+
+            let itemToExecute = CleanableItem(
+                id: candidate.cleanableItem.id,
+                name: candidate.cleanableItem.name,
+                category: .aiWorktreeArtifacts,
+                path: artPath,
+                logicalSize: candidate.logicalBytes,
+                physicalSize: candidate.physicalBytes,
+                reclaimableSize: candidate.reclaimableBytes > 0 ? candidate.reclaimableBytes : candidate.physicalBytes,
+                lastModified: candidate.lastModified,
+                riskLevel: candidate.classification,
+                explanation: candidate.classificationReason,
+                deletionConsequence: candidate.cleanableItem.deletionConsequence,
+                regenerationImpact: candidate.cleanableItem.regenerationImpact,
+                isRunningDependency: false,
+                actionType: .moveToTrashVerifiedWorktreeArtifact(
+                    path: artPath,
+                    worktreeRoot: wtPath,
+                    sourceRepoRoot: candidate.repositoryPath,
+                    expectedModifiedAt: candidate.lastModified
+                )
+            )
+
+            do {
+                let result = try await execute(itemToExecute)
+                switch result.status {
+                case .cleaned:
+                    cleanedPaths.append(artPath)
+                    reclaimedBytes += result.movedToTrashBytes > 0 ? result.movedToTrashBytes : candidate.physicalBytes
+                    if gitStatusDetails[wtPath] == nil {
+                        gitStatusDetails[wtPath] = "Unchanged"
+                    }
+                case .failed, .blocked:
+                    gitStatusPreserved = false
+                    let msg = result.message ?? "Cleanup failed for '\(candidate.relativePath)'."
+                    gitStatusDetails[wtPath] = msg
+                    if msg.contains("rolled back") {
+                        rolledBackPaths.append(artPath)
+                    }
+                    let failedEntry = WorktreeCleanupSkippedItem(
+                        path: artPath,
+                        artifactName: candidate.relativePath,
+                        worktreeName: candidate.worktreeName,
+                        classification: .caution,
+                        reason: msg
+                    )
+                    failedItems.append(failedEntry)
+                    skippedItems.append(failedEntry)
+                case .nothingEligible, .skipped:
+                    break
+                }
+            } catch {
+                skippedItems.append(
+                    WorktreeCleanupSkippedItem(
+                        path: artPath,
+                        artifactName: candidate.relativePath,
+                        worktreeName: candidate.worktreeName,
+                        classification: .review,
+                        reason: error.localizedDescription
+                    )
+                )
+            }
+        }
+
+        return WorktreeCleanupReport(
+            cleanedPaths: cleanedPaths,
+            reclaimedBytes: reclaimedBytes,
+            skippedItems: skippedItems,
+            rolledBackPaths: rolledBackPaths,
+            failedItems: failedItems,
+            gitStatusPreserved: gitStatusPreserved,
+            gitStatusDetails: gitStatusDetails
+        )
     }
 }

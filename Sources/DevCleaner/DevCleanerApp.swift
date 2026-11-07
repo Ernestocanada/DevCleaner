@@ -122,6 +122,13 @@ public struct DevCleanerApp: App {
             }
             RunLoop.main.run()
         }
+        if args.contains("--worktree-report") {
+            Task {
+                await Self.runHeadlessWorktreeReport()
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
     }
 
     public var body: some Scene {
@@ -228,6 +235,7 @@ public struct DevCleanerApp: App {
         let projectSummary = await MainActor.run { vm.projectSummary }
         let projectReports = await MainActor.run { vm.projectReports }
         let worktreeRecords = await MainActor.run { vm.worktreeRecords }
+        let worktreeSummary = await MainActor.run { vm.worktreeSummary }
         let macSummary = await MainActor.run { vm.macStorageSummary }
 
         print("=================================================================")
@@ -284,13 +292,22 @@ public struct DevCleanerApp: App {
             }
         }
 
-        let totalWorktreeBytes = worktreeRecords.reduce(Int64(0)) { $0 + $1.physicalBytes }
-        print("\n[GIT & CLAUDE WORKTREE ANALYZER — Informative Only]")
-        print("  Total Linked Worktrees:          \(worktreeRecords.count)")
-        print("  Total Worktrees Physical Size:   \(Formatters.bytes(totalWorktreeBytes))")
+        print("\n[AI WORKTREE DEPENDENCIES & BUILD ARTIFACTS]")
+        print("  Claude worktrees:                \(worktreeSummary.claudeWorktreesCount)")
+        print("  Codex worktrees:                 \(worktreeSummary.codexWorktreesCount)")
+        print("  Registered Git linked worktrees: \(worktreeSummary.gitLinkedWorktreesCount)")
+        print("  Worktree Footprint:              \(Formatters.bytes(worktreeSummary.totalWorktreesPhysicalBytes))")
+        print("  SAFE Reclaimable:                \(Formatters.bytes(worktreeSummary.safeRegenerableBytes))")
+        print("  Needs Review:                    \(Formatters.bytes(worktreeSummary.reviewRegenerableBytes))")
+        print("  Retained / non-SAFE:             \(Formatters.bytes(worktreeSummary.retainedBytes))")
+        print("  Active worktrees:                \(worktreeSummary.activeWorktreesCount)")
+        print("  Inactive worktrees:              \(worktreeSummary.inactiveWorktreesCount) (Strong cleanup candidates 14+d: \(worktreeSummary.strongCandidateWorktreesCount))")
         for wt in worktreeRecords {
             let dirtyNote = wt.hasUncommittedChanges ? "DIRTY (M:\(wt.modifiedFilesCount) S:\(wt.stagedFilesCount) U:\(wt.untrackedFilesCount))" : "CLEAN"
-            print("  • [\(wt.workLossRisk.rawValue)] [\(wt.sourceProjectName)] \(wt.path) (\(wt.branchLabel)) — \(Formatters.bytes(wt.physicalBytes)) | \(dirtyNote) | \(wt.remoteBranchStatus)")
+            print("  • [\(wt.originKind.shortAgentLabel)] \(wt.sourceProjectName) / \(wt.worktreeName) (\(wt.branchLabel)) — Total footprint: \(Formatters.bytes(wt.physicalBytes)) | SAFE reclaimable: \(Formatters.bytes(wt.safeRegenerableBytes)) | Needs Review: \(Formatters.bytes(wt.reviewRegenerableBytes)) | Retained after SAFE cleanup: \(Formatters.bytes(wt.retainedBytes)) | \(dirtyNote) | \(wt.activityState.rawValue)")
+            for cand in wt.artifactCandidates {
+                print("      - [\(cand.classification.rawValue)] [\(cand.gitTrackingState.rawValue)] \(cand.projectAndWorktreeDisplay) :: \(cand.artifactAndSizeDisplay) — \(cand.classificationReason)")
+            }
         }
 
         for cat in CleanerCategory.allCases where cat != .projectStorage {
@@ -306,5 +323,34 @@ public struct DevCleanerApp: App {
             }
         }
         print("\n=================================================================")
+    }
+
+    private static func runHeadlessWorktreeReport() async {
+        let analyzer = GitWorktreeAnalyzer()
+        let snapshot = await ProcessMonitor.shared.captureSnapshot()
+        let records = await analyzer.analyzeWorktrees(snapshot: snapshot)
+        let summary = WorktreeAnalysisSummary.from(records: records)
+
+        print("AI Worktree Dependencies & Build Artifacts")
+        print("- Claude worktrees: \(summary.claudeWorktreesCount)")
+        print("- Codex worktrees: \(summary.codexWorktreesCount)")
+        print("- Registered Git linked worktrees: \(summary.gitLinkedWorktreesCount)")
+        print("- SAFE Reclaimable: \(Formatters.bytes(summary.safeRegenerableBytes)) (\(summary.safeCandidatesCount) candidates)")
+        print("- Needs Review: \(Formatters.bytes(summary.reviewRegenerableBytes)) (\(summary.reviewCandidatesCount) candidates)")
+        print("- Worktree Footprint: \(Formatters.bytes(summary.totalWorktreesPhysicalBytes))")
+        print("- Retained / non-SAFE: \(Formatters.bytes(summary.retainedBytes))")
+        print("- Active worktrees: \(summary.activeWorktreesCount)")
+        print("- Inactive worktrees: \(summary.inactiveWorktreesCount) (Strong cleanup candidates 14+d: \(summary.strongCandidateWorktreesCount))")
+        print("")
+        for wt in records {
+            print("[\(wt.sourceProjectName) / \(wt.worktreeName)] Total footprint: \(Formatters.bytes(wt.physicalBytes)) | SAFE reclaimable: \(Formatters.bytes(wt.safeRegenerableBytes)) | Needs Review: \(Formatters.bytes(wt.reviewRegenerableBytes)) | Retained after SAFE cleanup: \(Formatters.bytes(wt.retainedBytes)) | \(wt.activityState.rawValue)")
+            for cand in wt.artifactCandidates {
+                print("  \(cand.projectAndWorktreeDisplay)")
+                print("  \(cand.artifactAndSizeDisplay)")
+                print("  \(cand.classification.rawValue) (\(cand.gitTrackingState.rawValue))")
+                print("  \(cand.classificationReason)")
+                print("")
+            }
+        }
     }
 }

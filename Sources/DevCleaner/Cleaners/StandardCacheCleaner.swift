@@ -1,21 +1,534 @@
 import Foundation
 
+public struct NpmCapabilities: Equatable, Sendable {
+    public let npmBinaryPath: String?
+    public let version: String?
+    public let effectiveCacheRoot: String
+    public let supportsCacheVerify: Bool
+    public let supportsCacheClean: Bool
+    public let supportsSelectiveNpxRemoval: Bool
+
+    public init(
+        npmBinaryPath: String?,
+        version: String? = nil,
+        effectiveCacheRoot: String,
+        supportsCacheVerify: Bool = true,
+        supportsCacheClean: Bool = true,
+        supportsSelectiveNpxRemoval: Bool = false
+    ) {
+        self.npmBinaryPath = npmBinaryPath
+        self.version = version
+        self.effectiveCacheRoot = effectiveCacheRoot
+        self.supportsCacheVerify = supportsCacheVerify
+        self.supportsCacheClean = supportsCacheClean
+        self.supportsSelectiveNpxRemoval = supportsSelectiveNpxRemoval
+    }
+}
+
+public struct NpmLiveUseState: Equatable, Sendable {
+    public let isDeterminedSafely: Bool
+    public let activeGlobalNpmProcesses: [String]
+    public let activeNpxEnvironmentKeys: Set<String>
+    public let activeProcessesByNpxKey: [String: [String]]
+
+    public init(
+        isDeterminedSafely: Bool = true,
+        activeGlobalNpmProcesses: [String] = [],
+        activeNpxEnvironmentKeys: Set<String> = [],
+        activeProcessesByNpxKey: [String: [String]] = [:]
+    ) {
+        self.isDeterminedSafely = isDeterminedSafely
+        self.activeGlobalNpmProcesses = activeGlobalNpmProcesses
+        self.activeNpxEnvironmentKeys = activeNpxEnvironmentKeys
+        self.activeProcessesByNpxKey = activeProcessesByNpxKey
+    }
+
+    public static let idle = NpmLiveUseState(
+        isDeterminedSafely: true,
+        activeGlobalNpmProcesses: [],
+        activeNpxEnvironmentKeys: [],
+        activeProcessesByNpxKey: [:]
+    )
+
+    public var hasAnyGlobalOrNpxUse: Bool {
+        !isDeterminedSafely || !activeGlobalNpmProcesses.isEmpty || !activeNpxEnvironmentKeys.isEmpty
+    }
+
+    public func isNpxKeyActive(_ key: String) -> Bool {
+        !isDeterminedSafely || !activeGlobalNpmProcesses.isEmpty || activeNpxEnvironmentKeys.contains(key)
+    }
+
+    public func processes(forKey key: String) -> [String] {
+        var result = Set(activeGlobalNpmProcesses)
+        if let specific = activeProcessesByNpxKey[key] {
+            result.formUnion(specific)
+        }
+        if !isDeterminedSafely && result.isEmpty {
+            result.insert("undetermined process state")
+        }
+        if result.isEmpty && activeNpxEnvironmentKeys.contains(key) {
+            result.insert("npx (\(key))")
+        }
+        return Array(result).sorted()
+    }
+
+    public var allActiveProcessDescriptions: [String] {
+        var result = Set(activeGlobalNpmProcesses)
+        for (_, procs) in activeProcessesByNpxKey {
+            result.formUnion(procs)
+        }
+        for key in activeNpxEnvironmentKeys where activeProcessesByNpxKey[key]?.isEmpty ?? true {
+            result.insert("npx (\(key))")
+        }
+        if !isDeterminedSafely && result.isEmpty {
+            result.insert("undetermined process state")
+        }
+        return Array(result).sorted()
+    }
+
+    public var activeNpxSummary: String {
+        let keys = activeNpxEnvironmentKeys.sorted()
+        let procs = allActiveProcessDescriptions
+        if !keys.isEmpty && !procs.isEmpty {
+            return "keys: \(keys.joined(separator: ", ")); processes: \(procs.joined(separator: ", "))"
+        }
+        if !keys.isEmpty {
+            return "keys: \(keys.joined(separator: ", "))"
+        }
+        if !procs.isEmpty {
+            return procs.joined(separator: ", ")
+        }
+        return "undetermined live process state"
+    }
+
+    public func primaryProcessLabel(forKeys keys: [String] = []) -> String {
+        for key in keys {
+            let procs = processes(forKey: key)
+            if !procs.isEmpty {
+                return procs.joined(separator: ", ")
+            }
+        }
+        let all = allActiveProcessDescriptions
+        return all.isEmpty ? "npm / npx" : all.joined(separator: ", ")
+    }
+}
+
+public enum NpmCacheInspector {
+    public static func resolveNpmBinary() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/npm",
+            "/usr/local/bin/npm",
+            "/usr/bin/npm"
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        return nil
+    }
+
+    /// Validates and canonicalizes an effective npm cache root directory, ensuring credentials, global packages,
+    /// and project `node_modules` are strictly outside the rule.
+    public static func validateAndCanonicalizeCacheRoot(
+        _ rawCacheRoot: String,
+        homeDirectory: String
+    ) throws -> String {
+        let trimmed = rawCacheRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw SafetyError.emptyOrInvalidPath
+        }
+        let rawParts = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        if rawParts.contains("..") {
+            throw SafetyError.containsParentTraversal(rawCacheRoot)
+        }
+
+        let cleanHome = homeDirectory.hasSuffix("/") && homeDirectory.count > 1
+            ? String(homeDirectory.dropLast())
+            : homeDirectory
+
+        var expanded = trimmed
+        if expanded == "~" {
+            expanded = cleanHome
+        } else if expanded.hasPrefix("~/") {
+            expanded = cleanHome + String(expanded.dropFirst(1))
+        }
+        guard expanded.hasPrefix("/") else {
+            throw SafetyError.emptyOrInvalidPath
+        }
+
+        let url = URL(fileURLWithPath: expanded)
+        var standardized = url.standardizedFileURL.path
+        if standardized.hasSuffix("/") && standardized.count > 1 {
+            standardized = String(standardized.dropLast())
+        }
+
+        if FileManager.default.fileExists(atPath: standardized) {
+            let vals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if vals?.isSymbolicLink == true {
+                throw SafetyError.symlinkTraversalRejected(standardized)
+            }
+        }
+
+        let components = standardized.split(separator: "/").map(String.init)
+        let forbiddenComponents: Set<String> = [
+            "node_modules", ".git", ".ssh", ".gnupg", ".aws", ".npmrc", "Keychains"
+        ]
+        for comp in components where forbiddenComponents.contains(comp) {
+            throw SafetyError.forbiddenFileOrComponent(standardized)
+        }
+
+        let forbiddenExactOrPrefixes: [String] = [
+            "\(cleanHome)/Developer",
+            "\(cleanHome)/Documents",
+            "\(cleanHome)/Desktop",
+            "\(cleanHome)/Downloads",
+            "\(cleanHome)/.ssh",
+            "\(cleanHome)/.gnupg",
+            "\(cleanHome)/.aws",
+            "\(cleanHome)/.config/gcloud",
+            "\(cleanHome)/.nvm",
+            "/System",
+            "/Applications",
+            "/Library",
+            "/opt/homebrew/lib",
+            "/usr/local/lib"
+        ]
+        for forbidden in forbiddenExactOrPrefixes {
+            if standardized == forbidden || standardized.hasPrefix(forbidden + "/") {
+                throw SafetyError.forbiddenProtectedPath(standardized)
+            }
+        }
+
+        let forbiddenExactRoots: Set<String> = [
+            "/",
+            "/Users",
+            "/private",
+            "/var",
+            "/tmp",
+            "/private/tmp",
+            cleanHome,
+            "\(cleanHome)/Library",
+            "\(cleanHome)/Library/Caches",
+            "\(cleanHome)/Library/Application Support",
+            "\(cleanHome)/.cache"
+        ]
+        if forbiddenExactRoots.contains(standardized) {
+            throw SafetyError.forbiddenProtectedPath(standardized)
+        }
+
+        return standardized
+    }
+
+    public static func parseNpmrcCachePath(npmrcContents: String) -> String? {
+        for rawLine in npmrcContents.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") { continue }
+            if line.hasPrefix("cache=") || line.hasPrefix("cache ") {
+                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+                if parts.count == 2 {
+                    var value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                    if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+                       (value.hasPrefix("'") && value.hasSuffix("'")) {
+                        value = String(value.dropFirst().dropLast())
+                    }
+                    if !value.isEmpty {
+                        return value
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    public static func discoverCapabilities(
+        homeDirectory: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        npmBinaryResolver: () -> String? = { resolveNpmBinary() },
+        shellRunner: @Sendable (String, [String]) async -> ShellResult = { exe, args in
+            await ShellRunner.shared.run(exe, arguments: args)
+        }
+    ) async -> NpmCapabilities {
+        let cleanHome = homeDirectory.hasSuffix("/") && homeDirectory.count > 1
+            ? String(homeDirectory.dropLast())
+            : homeDirectory
+        let defaultCacheRoot = "\(cleanHome)/.npm"
+        let npmBin = npmBinaryResolver()
+
+        var rawCandidateRoot: String? = nil
+        if let envCache = environment["NPM_CONFIG_CACHE"] ?? environment["npm_config_cache"],
+           !envCache.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            rawCandidateRoot = envCache
+        } else {
+            let npmrcPath = "\(cleanHome)/.npmrc"
+            if let npmrcText = try? String(contentsOfFile: npmrcPath, encoding: .utf8),
+               let parsed = parseNpmrcCachePath(npmrcContents: npmrcText) {
+                rawCandidateRoot = parsed
+            }
+        }
+
+        var versionString: String? = nil
+        var supportsSelectiveNpx = false
+
+        if let npmBin {
+            if rawCandidateRoot == nil {
+                let configRes = await shellRunner(npmBin, ["config", "get", "cache", "--loglevel=silent"])
+                if configRes.isSuccess {
+                    let out = configRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !out.isEmpty && out != "undefined" && out != "null" {
+                        rawCandidateRoot = out
+                    }
+                }
+            }
+            let helpRes = await shellRunner(npmBin, ["cache", "--help"])
+            if helpRes.isSuccess {
+                let helpOut = helpRes.stdout.lowercased()
+                if helpOut.contains("npm cache npx") {
+                    supportsSelectiveNpx = true
+                }
+            }
+            let verRes = await shellRunner(npmBin, ["--version"])
+            if verRes.isSuccess {
+                let v = verRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    versionString = v
+                }
+            }
+        }
+
+        let validatedRoot: String = {
+            if let candidate = rawCandidateRoot,
+               let valid = try? validateAndCanonicalizeCacheRoot(candidate, homeDirectory: cleanHome) {
+                return valid
+            }
+            return (try? validateAndCanonicalizeCacheRoot(defaultCacheRoot, homeDirectory: cleanHome)) ?? defaultCacheRoot
+        }()
+
+        return NpmCapabilities(
+            npmBinaryPath: npmBin,
+            version: versionString,
+            effectiveCacheRoot: validatedRoot,
+            supportsCacheVerify: npmBin != nil,
+            supportsCacheClean: npmBin != nil,
+            supportsSelectiveNpxRemoval: supportsSelectiveNpx
+        )
+    }
+
+    /// Inspects live npm/npx use across process command lines, descendant processes, executable paths,
+    /// current working directories, and open files/cache paths.
+    public static func inspectLiveUse(
+        cacheRoot: String,
+        snapshot: ActiveProcessSnapshot = .empty,
+        shellRunner: (@Sendable (String, [String]) async -> ShellResult)? = nil,
+        includeSystemQueries: Bool = true
+    ) async -> NpmLiveUseState {
+        let stdCacheRoot = URL(fileURLWithPath: cacheRoot).standardizedFileURL.path
+        let resolvedCacheRoot = URL(fileURLWithPath: stdCacheRoot).resolvingSymlinksInPath().path
+        let cacheRoots = Array(Set([stdCacheRoot, resolvedCacheRoot]))
+
+        var globalProcs = Set<String>()
+        var activeKeys = Set<String>()
+        var procsByKey: [String: Set<String>] = [:]
+
+        func recordKey(_ key: String, processLabel: String) {
+            guard !key.isEmpty && key != "." && key != ".." else { return }
+            activeKeys.insert(key)
+            procsByKey[key, default: []].insert(processLabel)
+        }
+
+        func extractNpxKeys(from text: String) -> [String] {
+            var found: [String] = []
+            let prefixes = cacheRoots.map { "\($0)/_npx/" } + ["/.npm/_npx/"]
+            for prefix in prefixes {
+                var searchRange = text.startIndex..<text.endIndex
+                while let match = text.range(of: prefix, range: searchRange) {
+                    let after = text[match.upperBound...]
+                    let key = after.prefix { $0 != "/" && !$0.isWhitespace && $0 != "\"" && $0 != "'" }
+                    if !key.isEmpty {
+                        found.append(String(key))
+                    }
+                    searchRange = match.upperBound..<text.endIndex
+                }
+            }
+            return Array(Set(found))
+        }
+
+        func friendlyLabel(fromLine line: String) -> String {
+            let lower = line.lowercased()
+            if lower.contains("firebase") { return "firebase (npx)" }
+            if lower.contains("desktop-commander") { return "desktop-commander (npx)" }
+            if lower.contains("playwright") { return "playwright (npx)" }
+            if lower.contains("mcp") { return "MCP server (npx)" }
+            if lower.contains("npx") { return "npx" }
+            if lower.contains("npm") { return "npm" }
+            let firstToken = line.split(separator: " ").first.map(String.init) ?? "node"
+            return URL(fileURLWithPath: firstToken).lastPathComponent
+        }
+
+        func inspectCommandLine(_ line: String) {
+            let keys = extractNpxKeys(from: line)
+            let label = friendlyLabel(fromLine: line)
+            for k in keys {
+                recordKey(k, processLabel: label)
+            }
+
+            let lower = line.lowercased()
+            let hasDirectNpmOrNpx = lower.contains("/npm ") || lower.hasSuffix("/npm") ||
+                lower.contains("npm-cli.js") || lower.contains("/npx ") || lower.hasSuffix("/npx") ||
+                lower.contains("npx-cli.js") || lower.hasPrefix("npm ") || lower.hasPrefix("npx ")
+            let referencesCacheRoot = cacheRoots.contains { root in
+                line.contains("\(root)/_cacache") || line.contains("\(root)/_logs") || line == root
+            }
+            if hasDirectNpmOrNpx || referencesCacheRoot {
+                globalProcs.insert(label)
+            }
+        }
+
+        for line in snapshot.activeLines {
+            inspectCommandLine(line)
+        }
+
+        if includeSystemQueries, let runner = shellRunner {
+            let psRes = await runner("/bin/ps", ["-axo", "pid=,ppid=,comm=,args="])
+            guard psRes.isSuccess else {
+                return NpmLiveUseState(
+                    isDeterminedSafely: false,
+                    activeGlobalNpmProcesses: ["undetermined process state"],
+                    activeNpxEnvironmentKeys: activeKeys,
+                    activeProcessesByNpxKey: procsByKey.mapValues { Array($0).sorted() }
+                )
+            }
+
+            struct ProcRow {
+                let pid: Int32
+                let ppid: Int32
+                let comm: String
+                let args: String
+            }
+
+            var rowsByPID: [Int32: ProcRow] = [:]
+            var childrenByPPID: [Int32: [Int32]] = [:]
+            var seedPIDs = Set<Int32>()
+            var seedKeyByPID: [Int32: Set<String>] = [:]
+
+            for rawLine in psRes.stdout.components(separatedBy: .newlines) {
+                let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let tokens = trimmed.split(maxSplits: 3, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+                guard tokens.count >= 3,
+                      let pid = Int32(tokens[0]),
+                      let ppid = Int32(tokens[1]) else { continue }
+                let comm = String(tokens[2])
+                let args = tokens.count >= 4 ? String(tokens[3]) : comm
+                let combined = "\(comm) \(args)"
+                let row = ProcRow(pid: pid, ppid: ppid, comm: comm, args: combined)
+                rowsByPID[pid] = row
+                childrenByPPID[ppid, default: []].append(pid)
+
+                inspectCommandLine(combined)
+                let keys = extractNpxKeys(from: combined)
+                if !keys.isEmpty {
+                    seedPIDs.insert(pid)
+                    seedKeyByPID[pid, default: []].formUnion(keys)
+                }
+                let lower = combined.lowercased()
+                if lower.contains("/npm ") || lower.contains("npm-cli.js") ||
+                   lower.contains("/npx ") || lower.contains("npx-cli.js") ||
+                   cacheRoots.contains(where: { combined.contains($0) }) {
+                    seedPIDs.insert(pid)
+                }
+            }
+
+            // Traverse descendant processes of any npm/npx/_npx seed process
+            var queue = Array(seedPIDs)
+            var visited = seedPIDs
+            while !queue.isEmpty {
+                let current = queue.removeFirst()
+                let inheritedKeys = seedKeyByPID[current] ?? []
+                for childPID in childrenByPPID[current] ?? [] {
+                    if !inheritedKeys.isEmpty {
+                        seedKeyByPID[childPID, default: []].formUnion(inheritedKeys)
+                    }
+                    if !visited.contains(childPID) {
+                        visited.insert(childPID)
+                        queue.append(childPID)
+                    }
+                }
+            }
+
+            for pid in visited {
+                guard let row = rowsByPID[pid] else { continue }
+                let label = friendlyLabel(fromLine: row.args)
+                let keys = seedKeyByPID[pid] ?? []
+                if !keys.isEmpty {
+                    for k in keys {
+                        recordKey(k, processLabel: label)
+                    }
+                } else {
+                    globalProcs.insert(label)
+                }
+            }
+
+            // Inspect open files and current working directories (`cwd`) via lsof if cacheRoot exists on disk
+            if FileManager.default.fileExists(atPath: stdCacheRoot) && FileManager.default.isExecutableFile(atPath: "/usr/sbin/lsof") {
+                let lsofRes = await runner("/usr/sbin/lsof", ["-Fpcn", "--", stdCacheRoot])
+                if lsofRes.exitCode == 0 || !lsofRes.stdout.isEmpty {
+                    var currentCmd = "process"
+                    for rawLine in lsofRes.stdout.components(separatedBy: .newlines) {
+                        guard rawLine.count > 1 else { continue }
+                        let prefix = rawLine.first!
+                        let value = String(rawLine.dropFirst())
+                        if prefix == "c" {
+                            currentCmd = value
+                        } else if prefix == "n" {
+                            let keys = extractNpxKeys(from: value)
+                            if !keys.isEmpty {
+                                for k in keys {
+                                    recordKey(k, processLabel: currentCmd)
+                                }
+                            } else if cacheRoots.contains(where: { value == $0 || value.hasPrefix($0 + "/") }) {
+                                globalProcs.insert(currentCmd)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return NpmLiveUseState(
+            isDeterminedSafely: true,
+            activeGlobalNpmProcesses: Array(globalProcs).sorted(),
+            activeNpxEnvironmentKeys: activeKeys,
+            activeProcessesByNpxKey: procsByKey.mapValues { Array($0).sorted() }
+        )
+    }
+}
+
 public struct StandardCacheCleaner: CleanerProvider {
     public let category: CleanerCategory
     private let home: String
     private let executor: CleanupExecutor
     private let planner: CleanupPlanner
+    private let npmCapabilitiesOverride: NpmCapabilities?
+    private let npmLiveUseOverride: NpmLiveUseState?
+    private let shellRunner: @Sendable (String, [String]) async -> ShellResult
 
     public init(
         category: CleanerCategory,
         homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
-        executor: CleanupExecutor? = nil
+        executor: CleanupExecutor? = nil,
+        npmCapabilitiesOverride: NpmCapabilities? = nil,
+        npmLiveUseOverride: NpmLiveUseState? = nil,
+        shellRunner: (@Sendable (String, [String]) async -> ShellResult)? = nil
     ) {
         self.category = category
         self.home = homeDirectory
         let validator = SafetyValidator(homeDirectory: homeDirectory)
         self.executor = executor ?? CleanupExecutor(validator: validator)
         self.planner = CleanupPlanner(validator: validator)
+        self.npmCapabilitiesOverride = npmCapabilitiesOverride
+        self.npmLiveUseOverride = npmLiveUseOverride
+        self.shellRunner = shellRunner ?? { exe, args in
+            await ShellRunner.shared.run(exe, arguments: args)
+        }
     }
 
     private struct TargetSpec {
@@ -147,39 +660,6 @@ public struct StandardCacheCleaner: CleanerProvider {
             ]
         case .nodeNpm:
             return [
-                TargetSpec(
-                    id: "npm-cacache",
-                    name: "npm Download Cache (_cacache)",
-                    relativePath: ".npm/_cacache",
-                    risk: .safe,
-                    explanation: "Content-addressable tarball cache of downloaded npm packages.",
-                    consequence: "Moves eligible cached package tarballs to macOS Trash. Installed project node_modules are untouched.",
-                    regeneration: "Packages are re-downloaded on demand when running npm install.",
-                    cleanContentsOnly: true,
-                    supportsAgeFilter: true
-                ),
-                TargetSpec(
-                    id: "npm-npx",
-                    name: "npm _npx Temporary Packages",
-                    relativePath: ".npm/_npx",
-                    risk: .safe,
-                    explanation: "One-off CLI packages downloaded and executed via npx.",
-                    consequence: "Moves eligible cached npx execution environments to macOS Trash.",
-                    regeneration: "Re-downloaded automatically the next time you run npx <pkg>.",
-                    cleanContentsOnly: true,
-                    supportsAgeFilter: true
-                ),
-                TargetSpec(
-                    id: "npm-logs",
-                    name: "npm Debug Logs",
-                    relativePath: ".npm/_logs",
-                    risk: .safe,
-                    explanation: "Debug log files from past npm commands.",
-                    consequence: "Moves eligible npm debug logs to macOS Trash.",
-                    regeneration: "Generated only when npm encounters errors or verbose logging.",
-                    cleanContentsOnly: true,
-                    supportsAgeFilter: true
-                ),
                 TargetSpec(
                     id: "pnpm-cache",
                     name: "pnpm Store & Metadata Cache",
@@ -477,6 +957,11 @@ public struct StandardCacheCleaner: CleanerProvider {
         let categoryProcs = snapshot.matchingProcesses(for: category)
         var items: [CleanableItem] = []
 
+        if category == .nodeNpm {
+            let npmItems = await scanNpmCacheAndNpx(snapshot: snapshot, ageFilter: ageFilter)
+            items.append(contentsOf: npmItems)
+        }
+
         for spec in specs {
             let fullPath = "\(home)/\(spec.relativePath)"
             guard FileManager.default.fileExists(atPath: fullPath) else { continue }
@@ -661,6 +1146,376 @@ public struct StandardCacheCleaner: CleanerProvider {
                         actionType: .readOnlyInfo(reason: "Virtual filesystem exposed by Apple CoreDevice.")
                     )
                 )
+            }
+        }
+
+        return items
+    }
+
+    private func scanNpmCacheAndNpx(snapshot: ActiveProcessSnapshot, ageFilter: AgeFilter) async -> [CleanableItem] {
+        let capabilities: NpmCapabilities
+        if let override = npmCapabilitiesOverride {
+            let validRoot = (try? NpmCacheInspector.validateAndCanonicalizeCacheRoot(override.effectiveCacheRoot, homeDirectory: home))
+                ?? "\(home)/.npm"
+            capabilities = NpmCapabilities(
+                npmBinaryPath: override.npmBinaryPath,
+                version: override.version,
+                effectiveCacheRoot: validRoot,
+                supportsCacheVerify: override.supportsCacheVerify,
+                supportsCacheClean: override.supportsCacheClean,
+                supportsSelectiveNpxRemoval: override.supportsSelectiveNpxRemoval
+            )
+        } else {
+            capabilities = await NpmCacheInspector.discoverCapabilities(
+                homeDirectory: home,
+                shellRunner: shellRunner
+            )
+        }
+
+        let cacheRoot = capabilities.effectiveCacheRoot
+        let liveUse: NpmLiveUseState
+        if let overrideLive = npmLiveUseOverride {
+            // Merge snapshot evidence with override
+            let snapUse = await NpmCacheInspector.inspectLiveUse(
+                cacheRoot: cacheRoot,
+                snapshot: snapshot,
+                shellRunner: nil,
+                includeSystemQueries: false
+            )
+            var mergedProcs = Set(overrideLive.activeGlobalNpmProcesses).union(snapUse.activeGlobalNpmProcesses)
+            let mergedKeys = overrideLive.activeNpxEnvironmentKeys.union(snapUse.activeNpxEnvironmentKeys)
+            var mergedByKey = overrideLive.activeProcessesByNpxKey
+            for (k, v) in snapUse.activeProcessesByNpxKey {
+                mergedByKey[k] = Array(Set(mergedByKey[k] ?? []).union(v)).sorted()
+            }
+            if !overrideLive.isDeterminedSafely && mergedProcs.isEmpty {
+                mergedProcs.insert("undetermined process state")
+            }
+            liveUse = NpmLiveUseState(
+                isDeterminedSafely: overrideLive.isDeterminedSafely && snapUse.isDeterminedSafely,
+                activeGlobalNpmProcesses: Array(mergedProcs).sorted(),
+                activeNpxEnvironmentKeys: mergedKeys,
+                activeProcessesByNpxKey: mergedByKey
+            )
+        } else {
+            liveUse = await NpmCacheInspector.inspectLiveUse(
+                cacheRoot: cacheRoot,
+                snapshot: snapshot,
+                shellRunner: shellRunner,
+                includeSystemQueries: npmCapabilitiesOverride == nil
+            )
+        }
+
+        let cacachePath = "\(cacheRoot)/_cacache"
+        let npxPath = "\(cacheRoot)/_npx"
+        let logsPath = "\(cacheRoot)/_logs"
+
+        let scopedValidator = SafetyValidator(
+            homeDirectory: home,
+            additionalAllowedPrefixes: [cacachePath, npxPath, logsPath]
+        )
+        let scopedPlanner = CleanupPlanner(validator: scopedValidator)
+        var items: [CleanableItem] = []
+
+        // 1. npm Download Cache (_cacache)
+        if FileManager.default.fileExists(atPath: cacachePath) {
+            let totalUsage = DiskScanner.shared.measurePath(cacachePath, minAgeDays: nil)
+            if totalUsage.physicalSize > 0 || totalUsage.logicalSize > 0 {
+                let plan = scopedPlanner.planDirectoryContents(
+                    directoryPath: cacachePath,
+                    baseRisk: .review,
+                    ageFilter: ageFilter,
+                    supportsAgeFilter: true,
+                    isRunningDependency: false
+                )
+                let nonProtectedPhysical = max(0, totalUsage.physicalSize - plan.protectedOrReviewBytes)
+                let nonProtectedLogical = max(0, totalUsage.logicalSize - plan.protectedOrReviewEntries.reduce(0) { $0 + $1.logicalBytes })
+                let isBlocked = liveUse.hasAnyGlobalOrNpxUse
+                let activeProcs = liveUse.allActiveProcessDescriptions
+
+                if !plan.eligibleEntries.isEmpty || !plan.tooRecentEntries.isEmpty {
+                    let action: CleanupActionType
+                    let consequenceText: String
+                    if capabilities.supportsCacheClean, capabilities.npmBinaryPath != nil, plan.protectedOrReviewEntries.isEmpty {
+                        action = .npmCacheCommand(cacheRoot: cacheRoot, subcommand: ["cache", "clean", "--force"])
+                        consequenceText = "Runs official 'npm cache clean --force --cache \(cacheRoot)' after re-verifying no npm/npx processes or open files are active. Requires explicit user selection."
+                    } else {
+                        let minDays = ageFilter != .all ? ageFilter.rawValue : nil
+                        action = .moveToTrashContents(directoryPath: cacachePath, minAgeDays: minDays)
+                        consequenceText = "Moves eligible cached package tarballs in \(cacachePath) to macOS Trash. Requires explicit user selection."
+                    }
+
+                    let statusDetail = isBlocked
+                        ? " • Status: Active / Protected from cleanup (\(liveUse.activeNpxSummary))"
+                        : ""
+
+                    items.append(
+                        CleanableItem(
+                            id: "npm-cacache",
+                            name: "npm Download Cache (_cacache)",
+                            category: .nodeNpm,
+                            path: cacachePath,
+                            logicalSize: nonProtectedLogical,
+                            physicalSize: nonProtectedPhysical,
+                            reclaimableSize: isBlocked ? 0 : plan.eligibleBytes,
+                            lastModified: plan.latestModified ?? totalUsage.lastModified,
+                            riskLevel: .review,
+                            explanation: "Occupied: \(Formatters.bytes(nonProtectedPhysical)) • Needs Review: \(Formatters.bytes(isBlocked ? 0 : plan.eligibleBytes))\(statusDetail). Content-addressable tarball cache in \(cacachePath). Explicit full cache cleaning requires clear user intent. Credentials (.npmrc), global packages, and project node_modules are outside this rule.",
+                            deletionConsequence: consequenceText,
+                            regenerationImpact: "Packages are re-downloaded on demand when running npm install.",
+                            isRunningDependency: isBlocked,
+                            runningProcessNames: activeProcs,
+                            actionType: action,
+                            supportsAgeFilter: true,
+                            plan: CleanupPlan(entries: plan.eligibleEntries + plan.tooRecentEntries)
+                        )
+                    )
+
+                    if capabilities.supportsCacheVerify && capabilities.npmBinaryPath != nil {
+                        items.append(
+                            CleanableItem(
+                                id: "npm-cache-verify",
+                                name: "npm Cache Verify & Garbage Collect (npm cache verify)",
+                                category: .nodeNpm,
+                                path: cacachePath,
+                                logicalSize: 0,
+                                physicalSize: 0,
+                                reclaimableSize: 0,
+                                lastModified: totalUsage.lastModified,
+                                riskLevel: .review,
+                                explanation: "Maintenance command ('npm cache verify --cache \(cacheRoot)'): verifies cache index integrity and garbage-collects unreferenced content blobs. Exact reclaim is unknown before execution (full download-cache upper bound: \(Formatters.bytes(nonProtectedPhysical))).",
+                                deletionConsequence: "Runs official 'npm cache verify --cache \(cacheRoot)'. Never deletes active npx tools, credentials, or project node_modules.",
+                                regenerationImpact: "Preserves valid referenced cache blobs and compacts index metadata.",
+                                isRunningDependency: isBlocked,
+                                runningProcessNames: activeProcs,
+                                actionType: .npmCacheCommand(cacheRoot: cacheRoot, subcommand: ["cache", "verify"]),
+                                supportsAgeFilter: false
+                            )
+                        )
+                    }
+                }
+
+                for protectedEntry in plan.protectedOrReviewEntries {
+                    let reasonText = protectedEntry.reason ?? "Contains protected-looking environment or credential file. Skipped for review."
+                    items.append(
+                        CleanableItem(
+                            id: "npm-cacache-review-\(protectedEntry.name)",
+                            name: "npm Download Cache (_cacache) — \(protectedEntry.name) (Skipped for Review)",
+                            category: .nodeNpm,
+                            path: protectedEntry.path,
+                            logicalSize: protectedEntry.logicalBytes,
+                            physicalSize: protectedEntry.physicalBytes,
+                            reclaimableSize: 0,
+                            lastModified: protectedEntry.lastModified,
+                            riskLevel: .review,
+                            explanation: reasonText,
+                            deletionConsequence: "Skipped automatically. Preserved on disk.",
+                            regenerationImpact: "Inspect manually in Finder if you want to review this cache entry.",
+                            isRunningDependency: isBlocked,
+                            runningProcessNames: activeProcs,
+                            actionType: .readOnlyInfo(reason: reasonText),
+                            supportsAgeFilter: false,
+                            plan: CleanupPlan(entries: [protectedEntry])
+                        )
+                    )
+                }
+            }
+        }
+
+        // 2. npm _npx Temporary Packages (_npx)
+        if FileManager.default.fileExists(atPath: npxPath) {
+            let totalUsage = DiskScanner.shared.measurePath(npxPath, minAgeDays: nil)
+            if totalUsage.physicalSize > 0 || totalUsage.logicalSize > 0 {
+                let plan = scopedPlanner.planDirectoryContents(
+                    directoryPath: npxPath,
+                    baseRisk: .review,
+                    ageFilter: ageFilter,
+                    supportsAgeFilter: true,
+                    isRunningDependency: false
+                )
+                let nonProtectedPhysical = max(0, totalUsage.physicalSize - plan.protectedOrReviewBytes)
+                let nonProtectedLogical = max(0, totalUsage.logicalSize - plan.protectedOrReviewEntries.reduce(0) { $0 + $1.logicalBytes })
+
+                if !capabilities.supportsSelectiveNpxRemoval {
+                    // Installed npm does NOT provide a documented selective npx-cache removal command => inventory-only
+                    let isActive = liveUse.hasAnyGlobalOrNpxUse
+                    let activeProcs = liveUse.allActiveProcessDescriptions
+                    let statusHeadline = isActive
+                        ? "Status: Active / Protected from cleanup"
+                        : "Status: Inventory only (selective npx removal unsupported by installed npm)"
+                    let activeDetail = isActive
+                        ? " Active live use detected (\(liveUse.activeNpxSummary))."
+                        : ""
+
+                    if nonProtectedPhysical > 0 || nonProtectedLogical > 0 {
+                        items.append(
+                            CleanableItem(
+                                id: "npm-npx",
+                                name: "npm _npx Temporary Packages",
+                                category: .nodeNpm,
+                                path: npxPath,
+                                logicalSize: nonProtectedLogical,
+                                physicalSize: nonProtectedPhysical,
+                                reclaimableSize: 0,
+                                lastModified: plan.latestModified ?? totalUsage.lastModified,
+                                riskLevel: .review,
+                                explanation: "Occupied: \(Formatters.bytes(nonProtectedPhysical)) • SAFE Reclaimable: 0 B • \(statusHeadline).\(activeDetail) Installed npm\(capabilities.version.map { " (\($0))" } ?? "") does not provide a supported selective npx-cache removal command; DevCleaner keeps _npx inventory-only rather than manually deleting cache environments.",
+                                deletionConsequence: "Inventory only (0 B reclaimable). DevCleaner does not blindly filesystem-delete _npx environments.",
+                                regenerationImpact: "Preserves active npx tools (such as MCP servers and CLI utilities).",
+                                isRunningDependency: isActive,
+                                runningProcessNames: activeProcs,
+                                actionType: .readOnlyInfo(reason: "\(statusHeadline). Installed npm does not support selective npx-cache removal."),
+                                supportsAgeFilter: false,
+                                plan: CleanupPlan(entries: plan.eligibleEntries + plan.tooRecentEntries)
+                            )
+                        )
+                    }
+                } else {
+                    // Installed npm supports selective npx removal (`npm cache npx rm <key>`)
+                    let activeEntries = plan.eligibleEntries.filter { liveUse.isNpxKeyActive($0.name) }
+                    let inactiveEntries = plan.eligibleEntries.filter { !liveUse.isNpxKeyActive($0.name) }
+
+                    for activeEntry in activeEntries {
+                        let keyProcs = liveUse.processes(forKey: activeEntry.name)
+                        items.append(
+                            CleanableItem(
+                                id: "npm-npx-active-\(activeEntry.name)",
+                                name: "npm _npx Active Environment — \(activeEntry.name)",
+                                category: .nodeNpm,
+                                path: activeEntry.path,
+                                logicalSize: activeEntry.logicalBytes,
+                                physicalSize: activeEntry.physicalBytes,
+                                reclaimableSize: 0,
+                                lastModified: activeEntry.lastModified,
+                                riskLevel: .review,
+                                explanation: "Occupied: \(Formatters.bytes(activeEntry.physicalBytes)) • SAFE Reclaimable: 0 B • Status: Active / Protected from cleanup. Currently in use by \(keyProcs.joined(separator: ", ")).",
+                                deletionConsequence: "Blocked: Active npx environment cannot be cleaned while in use.",
+                                regenerationImpact: "Serving active CLI / MCP tool process.",
+                                isRunningDependency: true,
+                                runningProcessNames: keyProcs,
+                                actionType: .readOnlyInfo(reason: "Status: Active / Protected from cleanup"),
+                                supportsAgeFilter: false,
+                                plan: CleanupPlan(entries: [activeEntry])
+                            )
+                        )
+                    }
+
+                    if !inactiveEntries.isEmpty && liveUse.isDeterminedSafely && liveUse.activeGlobalNpmProcesses.isEmpty {
+                        let inactivePhysical = inactiveEntries.reduce(Int64(0)) { $0 + $1.physicalBytes }
+                        let inactiveLogical = inactiveEntries.reduce(Int64(0)) { $0 + $1.logicalBytes }
+                        let inactiveKeys = inactiveEntries.map { $0.name }
+                        items.append(
+                            CleanableItem(
+                                id: "npm-npx",
+                                name: "npm _npx Temporary Packages",
+                                category: .nodeNpm,
+                                path: npxPath,
+                                logicalSize: inactiveLogical,
+                                physicalSize: inactivePhysical,
+                                reclaimableSize: inactivePhysical,
+                                lastModified: inactiveEntries.compactMap { $0.lastModified }.max() ?? totalUsage.lastModified,
+                                riskLevel: .review,
+                                explanation: "Occupied (inactive): \(Formatters.bytes(inactivePhysical)) across \(inactiveKeys.count) verified inactive npx environment(s) (\(inactiveKeys.joined(separator: ", "))). Uses supported selective removal ('npm cache npx rm').",
+                                deletionConsequence: "Removes selected inactive npx cache keys (\(inactiveKeys.joined(separator: ", "))) via official 'npm cache npx rm' after re-checking live processes and open files.",
+                                regenerationImpact: "Re-downloaded automatically the next time you run npx <pkg>.",
+                                isRunningDependency: false,
+                                runningProcessNames: [],
+                                actionType: .npmNpxRemoveKeys(cacheRoot: cacheRoot, keys: inactiveKeys),
+                                supportsAgeFilter: true,
+                                plan: CleanupPlan(entries: inactiveEntries + plan.tooRecentEntries)
+                            )
+                        )
+                    } else if activeEntries.isEmpty && (!liveUse.isDeterminedSafely || !liveUse.activeGlobalNpmProcesses.isEmpty) {
+                        let procs = liveUse.allActiveProcessDescriptions
+                        items.append(
+                            CleanableItem(
+                                id: "npm-npx",
+                                name: "npm _npx Temporary Packages",
+                                category: .nodeNpm,
+                                path: npxPath,
+                                logicalSize: nonProtectedLogical,
+                                physicalSize: nonProtectedPhysical,
+                                reclaimableSize: 0,
+                                lastModified: plan.latestModified ?? totalUsage.lastModified,
+                                riskLevel: .review,
+                                explanation: "Occupied: \(Formatters.bytes(nonProtectedPhysical)) • SAFE Reclaimable: 0 B • Status: Active / Protected from cleanup (\(liveUse.activeNpxSummary)).",
+                                deletionConsequence: "Blocked while npm/npx processes are active.",
+                                regenerationImpact: "Re-downloaded automatically the next time you run npx <pkg>.",
+                                isRunningDependency: true,
+                                runningProcessNames: procs,
+                                actionType: .npmNpxRemoveKeys(cacheRoot: cacheRoot, keys: plan.eligibleEntries.map { $0.name }),
+                                supportsAgeFilter: true,
+                                plan: CleanupPlan(entries: plan.eligibleEntries + plan.tooRecentEntries)
+                            )
+                        )
+                    }
+                }
+
+                for protectedEntry in plan.protectedOrReviewEntries {
+                    let reasonText = protectedEntry.reason ?? "Contains protected-looking environment file. Automatic SAFE cleanup skipped this cache entry."
+                    items.append(
+                        CleanableItem(
+                            id: "npm-npx-review-\(protectedEntry.name)",
+                            name: "npm _npx Temporary Packages — \(protectedEntry.name) (Skipped for Review)",
+                            category: .nodeNpm,
+                            path: protectedEntry.path,
+                            logicalSize: protectedEntry.logicalBytes,
+                            physicalSize: protectedEntry.physicalBytes,
+                            reclaimableSize: 0,
+                            lastModified: protectedEntry.lastModified,
+                            riskLevel: .review,
+                            explanation: reasonText,
+                            deletionConsequence: "Skipped by automatic SAFE cleanup. Preserved on disk.",
+                            regenerationImpact: "Inspect manually in Finder if you want to review this cache entry.",
+                            isRunningDependency: liveUse.isNpxKeyActive(protectedEntry.name),
+                            runningProcessNames: liveUse.processes(forKey: protectedEntry.name),
+                            actionType: .readOnlyInfo(reason: reasonText),
+                            supportsAgeFilter: false,
+                            plan: CleanupPlan(entries: [protectedEntry])
+                        )
+                    )
+                }
+            }
+        }
+
+        // 3. npm Debug Logs (_logs)
+        if FileManager.default.fileExists(atPath: logsPath) {
+            let totalUsage = DiskScanner.shared.measurePath(logsPath, minAgeDays: nil)
+            if totalUsage.physicalSize > 0 || totalUsage.logicalSize > 0 {
+                let minDays = ageFilter != .all ? ageFilter.rawValue : nil
+                let plan = scopedPlanner.planDirectoryContents(
+                    directoryPath: logsPath,
+                    baseRisk: .safe,
+                    ageFilter: ageFilter,
+                    supportsAgeFilter: true,
+                    isRunningDependency: false
+                )
+                let nonProtectedPhysical = max(0, totalUsage.physicalSize - plan.protectedOrReviewBytes)
+                let nonProtectedLogical = max(0, totalUsage.logicalSize - plan.protectedOrReviewEntries.reduce(0) { $0 + $1.logicalBytes })
+                let isLogsRunning = !liveUse.isDeterminedSafely || !liveUse.activeGlobalNpmProcesses.isEmpty
+                if !plan.eligibleEntries.isEmpty || !plan.tooRecentEntries.isEmpty {
+                    items.append(
+                        CleanableItem(
+                            id: "npm-logs",
+                            name: "npm Debug Logs",
+                            category: .nodeNpm,
+                            path: logsPath,
+                            logicalSize: nonProtectedLogical,
+                            physicalSize: nonProtectedPhysical,
+                            reclaimableSize: isLogsRunning ? 0 : plan.eligibleBytes,
+                            lastModified: plan.latestModified ?? totalUsage.lastModified,
+                            riskLevel: .safe,
+                            explanation: "Debug log files from past npm commands in \(logsPath).",
+                            deletionConsequence: "Moves eligible npm debug logs to macOS Trash.",
+                            regenerationImpact: "Generated only when npm encounters errors or verbose logging.",
+                            isRunningDependency: isLogsRunning,
+                            runningProcessNames: liveUse.activeGlobalNpmProcesses,
+                            actionType: .moveToTrashContents(directoryPath: logsPath, minAgeDays: minDays),
+                            supportsAgeFilter: true,
+                            plan: CleanupPlan(entries: plan.eligibleEntries + plan.tooRecentEntries)
+                        )
+                    )
+                }
             }
         }
 

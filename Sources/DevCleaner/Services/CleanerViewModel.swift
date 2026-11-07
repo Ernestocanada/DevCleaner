@@ -62,6 +62,8 @@ public final class CleanerViewModel: ObservableObject {
     @Published public var isScanningProjects: Bool = false
     @Published public var projectScanProgressText: String = ""
     @Published public var worktreeRecords: [GitWorktreeRecord] = []
+    @Published public var worktreeSummary: WorktreeAnalysisSummary = .empty
+    @Published public var worktreeInactivityConfig: WorktreeInactivityConfig = .default
     @Published public var isScanningWorktrees: Bool = false
     @Published public var macStorageSummary: MacStorageSummary = .empty
     @Published public var isScanningMacStorage: Bool = false
@@ -175,9 +177,11 @@ public final class CleanerViewModel: ObservableObject {
             )
         }
 
+        let wtConfig = self.worktreeInactivityConfig
         let worktreesTask = Task.detached(priority: .userInitiated) {
             await wAnalyzer.analyzeWorktrees(
                 in: rootToScan,
+                inactivityConfig: wtConfig,
                 snapshot: snapshot,
                 shouldCancel: { cancelFlag.isCancelled }
             )
@@ -289,7 +293,24 @@ public final class CleanerViewModel: ObservableObject {
         let wRecords = await worktreesTask.value
         guard self.activeScanToken == scanToken, !cancelFlag.isCancelled else { return }
         self.worktreeRecords = wRecords
+        self.worktreeSummary = WorktreeAnalysisSummary.from(records: wRecords)
         self.isScanningWorktrees = false
+
+        var withWorktrees = allScanned.filter { $0.category != .aiWorktreeArtifacts }
+        for record in wRecords {
+            for candidate in record.artifactCandidates {
+                withWorktrees.append(candidate.cleanableItem)
+            }
+        }
+        withWorktrees = MacStorageAnalyzer.deduplicateItems(withWorktrees)
+        withWorktrees.sort { a, b in
+            let idxA = categoryOrder.firstIndex(of: a.category) ?? 99
+            let idxB = categoryOrder.firstIndex(of: b.category) ?? 99
+            if idxA != idxB { return idxA < idxB }
+            if a.riskLevel != b.riskLevel { return a.riskLevel < b.riskLevel }
+            return a.physicalSize > b.physicalSize
+        }
+        self.items = withWorktrees
 
         isScanning = false
     }
@@ -301,6 +322,7 @@ public final class CleanerViewModel: ObservableObject {
         self.isScanningProjects = true
         self.isScanningWorktrees = true
         let rootToScan = projectsRootPath
+        let wtConfig = worktreeInactivityConfig
         let snapshot = await ProcessMonitor.shared.captureSnapshot()
         let pAnalyzer = self.projectAnalyzer
         let wAnalyzer = self.worktreeAnalyzer
@@ -322,6 +344,7 @@ public final class CleanerViewModel: ObservableObject {
         let wRecords = await Task.detached(priority: .userInitiated) {
             await wAnalyzer.analyzeWorktrees(
                 in: rootToScan,
+                inactivityConfig: wtConfig,
                 snapshot: snapshot,
                 shouldCancel: { cancelFlag.isCancelled }
             )
@@ -330,12 +353,13 @@ public final class CleanerViewModel: ObservableObject {
         self.projectReports = pReports
         self.projectSummary = pSummary
         self.worktreeRecords = wRecords
+        self.worktreeSummary = WorktreeAnalysisSummary.from(records: wRecords)
         self.isScanningProjects = false
         self.isScanningWorktrees = false
         self.projectScanProgressText = ""
 
-        // Replace .projectStorage items in self.items
-        var nonProjectItems = self.items.filter { $0.category != .projectStorage }
+        // Replace .projectStorage and .aiWorktreeArtifacts items in self.items
+        var nonProjectItems = self.items.filter { $0.category != .projectStorage && $0.category != .aiWorktreeArtifacts }
         let additionalItems = nonProjectItems.filter { $0.id.hasPrefix("appsupport-") || $0.id.hasPrefix("logs-") }
         let providerOnlyItems = nonProjectItems.filter { !$0.id.hasPrefix("appsupport-") && !$0.id.hasPrefix("logs-") }
         self.macStorageSummary = mAnalyzer.buildSummary(
@@ -348,6 +372,11 @@ public final class CleanerViewModel: ObservableObject {
         for report in pReports {
             for artifact in report.artifacts where artifact.reclaimableBytes > 0 {
                 nonProjectItems.append(artifact.cleanableItem)
+            }
+        }
+        for record in wRecords {
+            for candidate in record.artifactCandidates {
+                nonProjectItems.append(candidate.cleanableItem)
             }
         }
         self.items = MacStorageAnalyzer.deduplicateItems(nonProjectItems)
@@ -468,6 +497,67 @@ public final class CleanerViewModel: ObservableObject {
 
     public var selectedProjectReclaimableBytes: Int64 {
         selectedProjectItems.reduce(0) { $0 + $1.reclaimableSize }
+    }
+
+    public var allWorktreeCandidates: [WorktreeArtifactCandidate] {
+        worktreeRecords.flatMap { $0.artifactCandidates }
+    }
+
+    public var selectedWorktreeItems: [CleanableItem] {
+        selectedItems.filter { $0.category == .aiWorktreeArtifacts }
+    }
+
+    public var selectedWorktreeReclaimableBytes: Int64 {
+        selectedWorktreeItems.reduce(0) { $0 + $1.reclaimableSize }
+    }
+
+    public func selectSafeWorktreeArtifacts(inactiveOnly: Bool = true) {
+        let eligibleCandidates = allWorktreeCandidates.filter { candidate in
+            guard candidate.classification == .safe && candidate.reclaimableBytes > 0 && candidate.cleanableItem.canBeSelected else {
+                return false
+            }
+            if inactiveOnly {
+                return !candidate.isWorktreeActiveOrRecent
+            }
+            return true
+        }
+        for candidate in eligibleCandidates {
+            selectedIDs.insert(candidate.id)
+        }
+        let totalBytes = eligibleCandidates.reduce(Int64(0)) { $0 + $1.reclaimableBytes }
+        let scopeDesc = inactiveOnly
+            ? "inactive (\(worktreeInactivityConfig.inactiveDaysThreshold)+ days unused)"
+            : "all verified"
+        statusBannerMessage = "Selected \(eligibleCandidates.count) SAFE worktree artifacts from \(scopeDesc) worktrees (\(Formatters.bytes(totalBytes)))."
+    }
+
+    public func selectStrongCandidateWorktreeArtifacts() {
+        let strongCandidates = allWorktreeCandidates.filter { candidate in
+            candidate.classification == .safe &&
+            candidate.activityState == .staleStrongCandidate &&
+            candidate.reclaimableBytes > 0 &&
+            candidate.cleanableItem.canBeSelected
+        }
+        for candidate in strongCandidates {
+            selectedIDs.insert(candidate.id)
+        }
+        let totalBytes = strongCandidates.reduce(Int64(0)) { $0 + $1.reclaimableBytes }
+        statusBannerMessage = "Selected \(strongCandidates.count) SAFE worktree artifacts from stale worktrees unused \(worktreeInactivityConfig.strongCandidateDaysThreshold)+ days (\(Formatters.bytes(totalBytes)))."
+    }
+
+    public func clearWorktreeArtifactSelections() {
+        let wtIDs = Set(items.filter { $0.category == .aiWorktreeArtifacts }.map { $0.id })
+        selectedIDs.subtract(wtIDs)
+    }
+
+    public func updateWorktreeInactivityThreshold(inactiveDays: Int, strongDays: Int) {
+        worktreeInactivityConfig = WorktreeInactivityConfig(
+            inactiveDaysThreshold: inactiveDays,
+            strongCandidateDaysThreshold: strongDays
+        )
+        Task {
+            await rescanProjectsOnly()
+        }
     }
 
     public func activateDevelopmentCleanupMode(filter: AgeFilter = .sevenDays) {
@@ -611,10 +701,24 @@ public final class CleanerViewModel: ObservableObject {
 
             do {
                 let result = try await executor.execute(item, ageFilter: ageFilter)
-                totalProcessed += result.processedBytes
-                totalMovedToTrash += result.movedToTrashBytes
-
-                if result.status == .nothingEligible {
+                if result.status == .failed || result.status == .blocked {
+                    failCount += 1
+                    let failMsg = result.message ?? "Cleanup failed for \(item.name)."
+                    blockedMessages.append(failMsg)
+                    let entry = CleanupHistoryEntry(
+                        category: item.category.rawValue,
+                        itemName: item.name,
+                        path: item.exactCommandOrPathDescription,
+                        processedBytes: 0,
+                        movedToTrashBytes: 0,
+                        actuallyFreedBytes: 0,
+                        actionDescription: result.action.rawValue,
+                        status: result.status,
+                        success: false,
+                        message: failMsg
+                    )
+                    CleanupHistoryStore.shared.appendEntry(entry)
+                } else if result.status == .nothingEligible {
                     nothingEligibleCount += 1
                     let noOpMsg = result.message ?? (ageFilter != .all
                         ? "Nothing eligible for cleanup with the current \(ageFilter.rawValue)-day filter."
@@ -633,6 +737,8 @@ public final class CleanerViewModel: ObservableObject {
                     )
                     CleanupHistoryStore.shared.appendEntry(entry)
                 } else {
+                    totalProcessed += result.processedBytes
+                    totalMovedToTrash += result.movedToTrashBytes
                     successCount += 1
                     let note = result.message ?? "Moved to macOS Trash (\(Formatters.bytes(result.movedToTrashBytes))). Empty Trash to recover disk space."
                     let entry = CleanupHistoryEntry(

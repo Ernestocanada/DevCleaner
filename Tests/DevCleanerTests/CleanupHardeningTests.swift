@@ -42,7 +42,9 @@ final class CleanupHardeningTests: XCTestCase {
         simulatedFreeBefore: Int64 = 100_000_000_000,
         simulatedFreeAfter: Int64 = 100_000_000_000,
         activeProcesses: [CleanerCategory: [String]] = [:],
-        shellRunner: (@Sendable (String, [String]) async -> ShellResult)? = nil
+        shellRunner: (@Sendable (String, [String]) async -> ShellResult)? = nil,
+        npmCapabilitiesProvider: (@Sendable () async -> NpmCapabilities)? = nil,
+        npmLiveUseChecker: (@Sendable (String) async -> NpmLiveUseState)? = nil
     ) -> CleanupExecutor {
         let trashDir = self.tempTrash!
         let counter = LockCounter()
@@ -60,7 +62,9 @@ final class CleanupHardeningTests: XCTestCase {
             },
             shellRunner: shellRunner ?? { _, _ in
                 ShellResult(exitCode: 1, stdout: "", stderr: "Unmocked shell command blocked in isolated unit test")
-            }
+            },
+            npmCapabilitiesProvider: npmCapabilitiesProvider,
+            npmLiveUseChecker: npmLiveUseChecker
         )
     }
 
@@ -425,14 +429,17 @@ final class CleanupHardeningTests: XCTestCase {
         XCTAssertEqual(shutdown.riskLevel, .review)
         XCTAssertTrue(shutdown.canBeSelected)
 
-        // 3. Unavailable simulator => SAFE using official simctl operation
-        let unavailableBulk = try XCTUnwrap(items.first { $0.id == "sim-delete-unavailable" })
-        XCTAssertEqual(unavailableBulk.riskLevel, .safe)
-        XCTAssertEqual(unavailableBulk.actionType, .simctlDeleteUnavailable)
-        XCTAssertEqual(unavailableBulk.reclaimableSize, 250_000_000)
+        // 3. Unavailable simulator => NEVER automatic SAFE cleanup; enumerated individually as REVIEW
+        XCTAssertNil(items.first { $0.id == "sim-delete-unavailable" }, "Blanket simctl delete unavailable item must NOT be exposed")
 
         let unavailableIndividual = try XCTUnwrap(items.first { $0.id.contains("11111111-2222-3333-4444-555555555555") })
-        XCTAssertEqual(unavailableIndividual.riskLevel, .safe)
+        XCTAssertEqual(unavailableIndividual.riskLevel, .review, "Unavailable simulator must be REVIEW, never SAFE")
+        XCTAssertTrue(unavailableIndividual.canBeSelected, "Shutdown unavailable simulator can be explicitly selected")
+        XCTAssertEqual(unavailableIndividual.actionType, .simctlDeleteDevice(udid: "11111111-2222-3333-4444-555555555555"))
+        XCTAssertFalse(
+            CleanerViewModel.isEligibleForRecommendedSafeCleanup(unavailableIndividual),
+            "Unavailable simulator must NEVER be included in automatic Recommended SAFE cleanup"
+        )
 
         // 4. Runtimes mounted volumes => NEVER DELETE
         let runtimesMounted = try XCTUnwrap(items.first { $0.id == "sim-runtimes-preserved" })
@@ -592,6 +599,31 @@ final class CleanupHardeningTests: XCTestCase {
         XCTAssertEqual(claudeGPUCache.riskLevel, .safe)
         XCTAssertEqual(claudeSimBuilds.riskLevel, .review)
         XCTAssertEqual(claudeVMBundles.riskLevel, .review)
+        XCTAssertEqual(claudeVMBundles.reclaimableSize, 0, "Claude VM bundle actionable reclaim must be 0")
+        XCTAssertGreaterThan(claudeVMBundles.physicalSize, 0, "Claude VM bundle occupied storage must be reported separately")
+        XCTAssertFalse(claudeVMBundles.canBeSelected, "Claude VM bundle must be inventory-only and not selectable")
+        XCTAssertFalse(
+            CleanerViewModel.isEligibleForRecommendedSafeCleanup(claudeVMBundles),
+            "Claude VM bundle must never be included in automatic SAFE cleanup"
+        )
+        if case .readOnlyInfo(let reason) = claudeVMBundles.actionType {
+            XCTAssertTrue(reason.contains("sessiondata.img"))
+        } else {
+            XCTFail("Expected claudeVMBundles actionType to be .readOnlyInfo, got \(claudeVMBundles.actionType)")
+        }
+        XCTAssertTrue(claudeVMBundles.explanation.contains("Occupied:"))
+        XCTAssertTrue(claudeVMBundles.explanation.contains("SAFE Reclaimable: 0 B"))
+        XCTAssertTrue(claudeVMBundles.explanation.contains("sessiondata.img"))
+        let vmExecutor = makeIsolatedExecutor()
+        do {
+            _ = try await vmExecutor.execute(claudeVMBundles)
+            XCTFail("Claude VM bundle must be rejected by CleanupExecutor as read-only inventory")
+        } catch let error as CleanerError {
+            guard case .readOnlyItem = error else {
+                XCTFail("Expected readOnlyItem for Claude VM bundle, got \(error)")
+                return
+            }
+        }
         XCTAssertEqual(claudeSessions.riskLevel, .neverDelete)
         XCTAssertFalse(claudeSessions.canBeSelected)
         XCTAssertTrue(claudeSimBuilds.explanation.contains("These files can be regenerated, but Claude may need to rebuild or download them again."))
@@ -770,45 +802,45 @@ final class CleanupHardeningTests: XCTestCase {
     func testProtectedChildInDisposableCacheIsIsolatedAndSiblingsAreCleaned() async throws {
         // cache-A: SAFE
         let fileA = try createFile(
-            relativeToHome: ".npm/_npx/cache-A/node_modules/pkgA/index.js",
+            relativeToHome: ".gradle/caches/cache-A/modules/pkgA.jar",
             sizeBytes: 16384
         )
-        // cache-B: contains .env inside node_modules/twilio-cli/node_modules/bottleneck/.env
+        // cache-B: contains .env inside nested subtree
         let fileBEnv = try createFile(
-            relativeToHome: ".npm/_npx/cache-B/node_modules/twilio-cli/node_modules/bottleneck/.env",
+            relativeToHome: ".gradle/caches/cache-B/transforms/bottleneck/.env",
             sizeBytes: 37
         )
         // cache-C: SAFE
         let fileC = try createFile(
-            relativeToHome: ".npm/_npx/cache-C/node_modules/pkgC/index.js",
+            relativeToHome: ".gradle/caches/cache-C/modules/pkgC.jar",
             sizeBytes: 16384
         )
 
-        // Verify .env inside node_modules remains strictly blocked by SafetyValidator
-        XCTAssertFalse(validator.isSafeToDelete(fileBEnv.path, checkSymlinksOnDisk: false), ".env must remain strictly protected even inside node_modules")
+        // Verify .env inside cache remains strictly blocked by SafetyValidator
+        XCTAssertFalse(validator.isSafeToDelete(fileBEnv.path, checkSymlinksOnDisk: false), ".env must remain strictly protected even inside caches")
 
         let executor = makeIsolatedExecutor()
-        let npmCleaner = StandardCacheCleaner(category: .nodeNpm, homeDirectory: tempHome.path, executor: executor)
-        let scannedItems = await npmCleaner.scan(snapshot: .empty, ageFilter: .all)
+        let gradleCleaner = StandardCacheCleaner(category: .gradle, homeDirectory: tempHome.path, executor: executor)
+        let scannedItems = await gradleCleaner.scan(snapshot: .empty, ageFilter: .all)
 
         // Expect:
-        // 1) Main SAFE item for _npx containing eligible entries cache-A and cache-C only
-        let safeNpxItem = try XCTUnwrap(scannedItems.first { $0.id == "npm-npx" })
-        XCTAssertEqual(safeNpxItem.riskLevel, .safe)
-        XCTAssertTrue(safeNpxItem.canBeSelected)
-        let eligibleNames = Set(safeNpxItem.plan?.eligibleEntries.map { $0.name } ?? [])
+        // 1) Main SAFE item for gradle-caches containing eligible entries cache-A and cache-C only
+        let safeCacheItem = try XCTUnwrap(scannedItems.first { $0.id == "gradle-caches" })
+        XCTAssertEqual(safeCacheItem.riskLevel, .safe)
+        XCTAssertTrue(safeCacheItem.canBeSelected)
+        let eligibleNames = Set(safeCacheItem.plan?.eligibleEntries.map { $0.name } ?? [])
         XCTAssertEqual(eligibleNames, Set(["cache-A", "cache-C"]), "Recommended SAFE item must include cache-A and cache-C only")
 
         // 2) Isolated REVIEW item for cache-B (contains .env), not selectable by Recommended Cleanup
-        let reviewChildItem = try XCTUnwrap(scannedItems.first { $0.id == "npm-npx-review-cache-B" })
+        let reviewChildItem = try XCTUnwrap(scannedItems.first { $0.id == "gradle-caches-review-cache-B" })
         XCTAssertEqual(reviewChildItem.riskLevel, .review)
         XCTAssertFalse(reviewChildItem.canBeSelected, "Protected child cache-B must not be selectable by Recommended Cleanup")
         XCTAssertTrue(reviewChildItem.explanation.contains("Contains protected-looking environment file"))
 
         // 3) Executing the SAFE item cleans cache-A and cache-C while preserving cache-B
-        let result = try await executor.execute(safeNpxItem, ageFilter: .all)
+        let result = try await executor.execute(safeCacheItem, ageFilter: .all)
         XCTAssertEqual(result.status, .cleaned)
-        XCTAssertEqual(result.processedBytes, safeNpxItem.reclaimableSize)
+        XCTAssertEqual(result.processedBytes, safeCacheItem.reclaimableSize)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileA.path), "cache-A must be cleaned")
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileC.path), "cache-C must be cleaned")
         XCTAssertTrue(FileManager.default.fileExists(atPath: fileBEnv.path), "cache-B containing .env must be preserved untouched")
@@ -1191,6 +1223,418 @@ final class CleanupHardeningTests: XCTestCase {
         }
 
         XCTAssertTrue(recorder.calls.isEmpty, "Neither runtime deletion nor unavailable deletion may execute while Simulator is active")
+
+        // Even when Simulator is NOT active, blanket simctlDeleteUnavailable is permanently blocked
+        let idleExecutor = makeIsolatedExecutor()
+        do {
+            _ = try await idleExecutor.execute(unavailableItem)
+            XCTFail("Expected readOnlyItem for blanket simctlDeleteUnavailable even when Simulator is idle")
+        } catch let error as CleanerError {
+            guard case .readOnlyItem = error else {
+                XCTFail("Expected readOnlyItem, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testUnavailableAndTransitionalSimulatorsAndExecutionRevalidation() async throws {
+        let fixtureJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
+              {
+                "udid": "11111111-2222-3333-4444-555555555555",
+                "name": "Unavailable iPhone 16",
+                "state": "Shutdown",
+                "isAvailable": false,
+                "availabilityError": "runtime profile not found",
+                "dataPathSize": 250000000,
+                "logPathSize": 0
+              },
+              {
+                "udid": "22222222-3333-4444-5555-666666666666",
+                "name": "Transitional Creating Sim",
+                "state": "Creating",
+                "isAvailable": true,
+                "dataPathSize": 120000000,
+                "logPathSize": 0
+              },
+              {
+                "udid": "33333333-4444-5555-6666-777777777777",
+                "name": "Transitional Shutting Down Sim",
+                "state": "Shutting Down",
+                "isAvailable": false,
+                "dataPathSize": 180000000,
+                "logPathSize": 0
+              },
+              {
+                "udid": "44444444-5555-6666-7777-888888888888",
+                "name": "QA Regression iPhone",
+                "state": "Shutdown",
+                "isAvailable": false,
+                "dataPathSize": 300000000,
+                "logPathSize": 0
+              }
+            ]
+          }
+        }
+        """
+
+        let items = try SimulatorCleaner.parseDevicesJSON(
+            fixtureJSON.data(using: .utf8)!,
+            homeDirectory: tempHome.path,
+            xcodeDeveloperDir: "/Applications/Xcode.app/Contents/Developer"
+        )
+
+        // 1. Unavailable Shutdown simulator => REVIEW, selectable, never in Recommended SAFE cleanup
+        let unavailableShutdown = try XCTUnwrap(items.first { $0.id == "sim-device-11111111-2222-3333-4444-555555555555" })
+        XCTAssertEqual(unavailableShutdown.riskLevel, .review)
+        XCTAssertTrue(unavailableShutdown.canBeSelected)
+        XCTAssertEqual(unavailableShutdown.reclaimableSize, 250_000_000)
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(unavailableShutdown))
+        XCTAssertEqual(unavailableShutdown.simulatorMetadata?.runtimeIdentifier, "com.apple.CoreSimulator.SimRuntime.iOS-26-3")
+        XCTAssertEqual(unavailableShutdown.simulatorMetadata?.availabilityError, "runtime profile not found")
+        XCTAssertEqual(unavailableShutdown.simulatorMetadata?.xcodeDeveloperDir, "/Applications/Xcode.app/Contents/Developer")
+
+        // 2. Transitional states (Creating, Shutting Down) => blocked from selection and deletion
+        let creatingSim = try XCTUnwrap(items.first { $0.id == "sim-device-22222222-3333-4444-5555-666666666666" })
+        let shuttingDownSim = try XCTUnwrap(items.first { $0.id == "sim-device-33333333-4444-5555-6666-777777777777" })
+        for transitional in [creatingSim, shuttingDownSim] {
+            XCTAssertTrue(transitional.isRunningDependency)
+            XCTAssertFalse(transitional.canBeSelected)
+            XCTAssertEqual(transitional.reclaimableSize, 0)
+        }
+        XCTAssertEqual(creatingSim.simulatorMetadata?.displayBadgeText, "ACTIVE (CREATING) — protected")
+        XCTAssertEqual(shuttingDownSim.simulatorMetadata?.displayBadgeText, "ACTIVE (SHUTTING DOWN) — protected")
+
+        // 3. QA device protection => flagged as QA device, riskLevel is REVIEW, never default-selected
+        let qaSim = try XCTUnwrap(items.first { $0.id == "sim-device-44444444-5555-6666-7777-888888888888" })
+        XCTAssertEqual(qaSim.simulatorMetadata?.isNamedQADevice, true)
+        XCTAssertEqual(qaSim.riskLevel, .review)
+        XCTAssertFalse(CleanerViewModel.isEligibleForRecommendedSafeCleanup(qaSim))
+
+        // 4. Execution revalidation: if Xcode selection changes between scan and execution => blocked
+        let xcodeMismatchExecutor = makeIsolatedExecutor(
+            shellRunner: { exe, args in
+                if exe == "/usr/bin/xcode-select" && args == ["-p"] {
+                    return ShellResult(exitCode: 0, stdout: "/Applications/Xcode-Beta.app/Contents/Developer\n", stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Unexpected command")
+            }
+        )
+        do {
+            _ = try await xcodeMismatchExecutor.execute(unavailableShutdown)
+            XCTFail("Expected Xcode selection mismatch to block unavailable simulator deletion")
+        } catch let error as CleanerError {
+            guard case .commandFailed(let details) = error else {
+                XCTFail("Expected commandFailed for Xcode selection mismatch, got \(error)")
+                return
+            }
+            XCTAssertTrue(details.contains("Active Xcode selection changed since scan"))
+        }
+
+        // 5. Execution revalidation: if unavailable device becomes available after Xcode switch/runtime mount => blocked
+        let becameAvailableJSON = """
+        {
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
+              {
+                "udid": "11111111-2222-3333-4444-555555555555",
+                "name": "Unavailable iPhone 16",
+                "state": "Shutdown",
+                "isAvailable": true,
+                "dataPathSize": 250000000,
+                "logPathSize": 0
+              }
+            ]
+          }
+        }
+        """
+        let availabilityChangedExecutor = makeIsolatedExecutor(
+            shellRunner: { exe, args in
+                if exe == "/usr/bin/xcode-select" && args == ["-p"] {
+                    return ShellResult(exitCode: 0, stdout: "/Applications/Xcode.app/Contents/Developer\n", stderr: "")
+                }
+                if args == ["simctl", "list", "devices", "-j"] {
+                    return ShellResult(exitCode: 0, stdout: becameAvailableJSON, stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Unexpected command")
+            }
+        )
+        do {
+            _ = try await availabilityChangedExecutor.execute(unavailableShutdown)
+            XCTFail("Expected availability change to block simulator deletion")
+        } catch let error as CleanerError {
+            guard case .commandFailed(let details) = error else {
+                XCTFail("Expected commandFailed for availability change, got \(error)")
+                return
+            }
+            XCTAssertTrue(details.contains("availability changed since scan"))
+        }
+
+        // 6. Execution revalidation: when Xcode selection, UDID, runtime, availability, and Shutdown state all match => deletes via xcrun simctl delete <UDID>
+        let recorder = CommandRecorder()
+        let validDeleteExecutor = makeIsolatedExecutor(
+            simulatedFreeBefore: 100_000_000_000,
+            simulatedFreeAfter: 100_250_000_000,
+            shellRunner: { exe, args in
+                recorder.record(executable: exe, arguments: args)
+                if exe == "/usr/bin/xcode-select" && args == ["-p"] {
+                    return ShellResult(exitCode: 0, stdout: "/Applications/Xcode.app/Contents/Developer\n", stderr: "")
+                }
+                if args == ["simctl", "list", "devices", "-j"] {
+                    return ShellResult(exitCode: 0, stdout: fixtureJSON, stderr: "")
+                }
+                if args == ["simctl", "delete", "11111111-2222-3333-4444-555555555555"] {
+                    return ShellResult(exitCode: 0, stdout: "", stderr: "")
+                }
+                return ShellResult(exitCode: 1, stdout: "", stderr: "Unexpected command")
+            }
+        )
+        let deleteResult = try await validDeleteExecutor.execute(unavailableShutdown)
+        XCTAssertEqual(deleteResult.status, .cleaned)
+        XCTAssertEqual(deleteResult.action, .simctlDelete)
+        XCTAssertEqual(recorder.calls, [
+            ["/usr/bin/xcode-select", "-p"],
+            ["/usr/bin/xcrun", "simctl", "list", "devices", "-j"],
+            ["/usr/bin/xcrun", "simctl", "delete", "11111111-2222-3333-4444-555555555555"]
+        ])
+    }
+
+    func testNpmAndNpxHardeningAgainstActiveToolsAndCapabilities() async throws {
+        // Populate two _npx environments and _cacache in default ~/.npm
+        _ = try createFile(
+            relativeToHome: ".npm/_cacache/content-v2/sha512/aa/bb/blob1",
+            sizeBytes: 32768
+        )
+        _ = try createFile(
+            relativeToHome: ".npm/_npx/8843fba6d2859245/node_modules/firebase-tools/bin/firebase.js",
+            sizeBytes: 65536
+        )
+        _ = try createFile(
+            relativeToHome: ".npm/_npx/deadbeef12345678/node_modules/cowsay/index.js",
+            sizeBytes: 16384
+        )
+        let defaultCacheRoot = tempHome.appendingPathComponent(".npm").standardizedFileURL.path
+
+        // Scenario 1: Unsupported selective npx removal (e.g. npm 10.9.9) => _npx is inventory-only
+        let unsupportedCaps = NpmCapabilities(
+            npmBinaryPath: "/opt/homebrew/bin/npm",
+            version: "10.9.9",
+            effectiveCacheRoot: defaultCacheRoot,
+            supportsCacheVerify: true,
+            supportsCacheClean: true,
+            supportsSelectiveNpxRemoval: false
+        )
+        let idleState = NpmLiveUseState(
+            isDeterminedSafely: true,
+            activeGlobalNpmProcesses: [],
+            activeNpxEnvironmentKeys: [],
+            activeProcessesByNpxKey: [:]
+        )
+
+        let unsupportedCleaner = StandardCacheCleaner(
+            category: .nodeNpm,
+            homeDirectory: tempHome.path,
+            executor: makeIsolatedExecutor(),
+            npmCapabilitiesOverride: unsupportedCaps,
+            npmLiveUseOverride: idleState
+        )
+        let unsupportedItems = await unsupportedCleaner.scan(snapshot: .empty, ageFilter: .all)
+
+        let npxInventoryOnly = try XCTUnwrap(unsupportedItems.first { $0.id == "npm-npx" })
+        XCTAssertEqual(npxInventoryOnly.riskLevel, .review)
+        XCTAssertEqual(npxInventoryOnly.reclaimableSize, 0, "Unsupported selective npx removal must have 0 reclaimable bytes")
+        XCTAssertFalse(npxInventoryOnly.canBeSelected, "Inventory-only _npx must not be selectable")
+        if case .readOnlyInfo(let reason) = npxInventoryOnly.actionType {
+            XCTAssertTrue(reason.contains("Installed npm does not support selective npx-cache removal"))
+        } else {
+            XCTFail("Expected .readOnlyInfo when selective npx removal is unsupported")
+        }
+
+        let verifyItem = try XCTUnwrap(unsupportedItems.first { $0.id == "npm-cache-verify" })
+        XCTAssertEqual(verifyItem.riskLevel, .review)
+        XCTAssertEqual(verifyItem.reclaimableSize, 0, "npm cache verify exact reclaim is unknown before execution")
+        XCTAssertTrue(verifyItem.canBeSelected, "npm cache verify maintenance command can be selected when idle")
+        XCTAssertFalse(
+            CleanerViewModel.isEligibleForRecommendedSafeCleanup(verifyItem),
+            "0-reclaim maintenance verify must not inflate automatic SAFE cleanup totals"
+        )
+
+        let forceCleanItem = try XCTUnwrap(unsupportedItems.first { $0.id == "npm-cacache" })
+        XCTAssertEqual(forceCleanItem.riskLevel, .review, "Full npm cache clean --force requires explicit user intent (REVIEW)")
+
+        // Scenario 2: Active npx environment (detected via descendant process tree & lsof open file/cwd) => blocked
+        let snapshotWithActiveMcp = ActiveProcessSnapshot(
+            activeLines: ["node \(defaultCacheRoot)/_npx/8843fba6d2859245/node_modules/.bin/firebase-mcp"],
+            runningAppNames: ["node"]
+        )
+        let detectedLiveState = await NpmCacheInspector.inspectLiveUse(
+            cacheRoot: defaultCacheRoot,
+            snapshot: snapshotWithActiveMcp,
+            shellRunner: { exe, _ in
+                if exe == "/bin/ps" {
+                    // Parent npx (pid 500) -> child node (pid 501)
+                    let psOut = """
+                      500     1 npx npx -y @firebase/mcp
+                      501   500 node /usr/local/bin/node
+                    """
+                    return ShellResult(exitCode: 0, stdout: psOut, stderr: "")
+                }
+                if exe == "/usr/sbin/lsof" {
+                    let lsofOut = """
+                    p501
+                    cnode
+                    fcwd
+                    n\(defaultCacheRoot)/_npx/8843fba6d2859245/node_modules/firebase-tools
+                    """
+                    return ShellResult(exitCode: 0, stdout: lsofOut, stderr: "")
+                }
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            includeSystemQueries: true
+        )
+        XCTAssertTrue(detectedLiveState.hasAnyGlobalOrNpxUse)
+        XCTAssertTrue(detectedLiveState.activeNpxEnvironmentKeys.contains("8843fba6d2859245"))
+
+        let activeCleaner = StandardCacheCleaner(
+            category: .nodeNpm,
+            homeDirectory: tempHome.path,
+            executor: makeIsolatedExecutor(),
+            npmCapabilitiesOverride: unsupportedCaps,
+            npmLiveUseOverride: detectedLiveState
+        )
+        let activeItems = await activeCleaner.scan(snapshot: snapshotWithActiveMcp, ageFilter: .all)
+        let activeNpxItem = try XCTUnwrap(activeItems.first { $0.id == "npm-npx" })
+        XCTAssertTrue(activeNpxItem.isRunningDependency)
+        XCTAssertEqual(activeNpxItem.reclaimableSize, 0)
+        XCTAssertFalse(activeNpxItem.canBeSelected)
+        XCTAssertTrue(activeNpxItem.explanation.contains("Status: Active / Protected from cleanup"))
+
+        // Scenario 3: Supported selective npx removal (`npm cache npx rm <key>`) with 1 active key and 1 inactive key
+        let supportedCaps = NpmCapabilities(
+            npmBinaryPath: "/opt/homebrew/bin/npm",
+            version: "11.2.0",
+            effectiveCacheRoot: defaultCacheRoot,
+            supportsCacheVerify: true,
+            supportsCacheClean: true,
+            supportsSelectiveNpxRemoval: true
+        )
+        let partialActiveState = NpmLiveUseState(
+            isDeterminedSafely: true,
+            activeGlobalNpmProcesses: [],
+            activeNpxEnvironmentKeys: ["8843fba6d2859245"],
+            activeProcessesByNpxKey: ["8843fba6d2859245": ["node (PID 501)"]]
+        )
+        let selectiveCleaner = StandardCacheCleaner(
+            category: .nodeNpm,
+            homeDirectory: tempHome.path,
+            executor: makeIsolatedExecutor(),
+            npmCapabilitiesOverride: supportedCaps,
+            npmLiveUseOverride: partialActiveState
+        )
+        let selectiveItems = await selectiveCleaner.scan(snapshot: .empty, ageFilter: .all)
+        let selectiveNpxItem = try XCTUnwrap(selectiveItems.first { $0.id == "npm-npx" })
+        XCTAssertEqual(selectiveNpxItem.riskLevel, .review)
+        XCTAssertTrue(selectiveNpxItem.canBeSelected)
+        XCTAssertEqual(
+            selectiveNpxItem.actionType,
+            .npmNpxRemoveKeys(cacheRoot: defaultCacheRoot, keys: ["deadbeef12345678"]),
+            "Only the inactive npx key may be included; active key 8843fba6d2859245 must be excluded"
+        )
+        let activeKeyReviewItem = try XCTUnwrap(selectiveItems.first { $0.id == "npm-npx-active-8843fba6d2859245" })
+        XCTAssertTrue(activeKeyReviewItem.isRunningDependency)
+        XCTAssertFalse(activeKeyReviewItem.canBeSelected)
+        XCTAssertEqual(activeKeyReviewItem.reclaimableSize, 0)
+
+        // Scenario 4: Process starts between scan and execution => blocked by CleanupExecutor re-check
+        let recorder = CommandRecorder()
+        let raceBlockedExecutor = makeIsolatedExecutor(
+            shellRunner: { exe, args in
+                recorder.record(executable: exe, arguments: args)
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            npmCapabilitiesProvider: { supportedCaps },
+            npmLiveUseChecker: { _ in
+                // Process started on deadbeef12345678 right after scan!
+                NpmLiveUseState(
+                    isDeterminedSafely: true,
+                    activeGlobalNpmProcesses: [],
+                    activeNpxEnvironmentKeys: ["deadbeef12345678"],
+                    activeProcessesByNpxKey: ["deadbeef12345678": ["npx (PID 900)"]]
+                )
+            }
+        )
+        do {
+            _ = try await raceBlockedExecutor.execute(selectiveNpxItem)
+            XCTFail("Expected runningProcessActive when npx environment becomes active between scan and execution")
+        } catch let error as CleanerError {
+            guard case .runningProcessActive = error else {
+                XCTFail("Expected runningProcessActive, got \(error)")
+                return
+            }
+        }
+        XCTAssertTrue(recorder.calls.isEmpty, "npm cache npx rm must never run when live re-check detects active process")
+
+        // Also verify when inactive at execution time, `npm cache npx rm deadbeef12345678` executes cleanly
+        let cleanExecExecutor = makeIsolatedExecutor(
+            simulatedFreeBefore: 100_000_000_000,
+            simulatedFreeAfter: 100_016_384,
+            shellRunner: { exe, args in
+                recorder.record(executable: exe, arguments: args)
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            npmCapabilitiesProvider: { supportedCaps },
+            npmLiveUseChecker: { _ in idleState }
+        )
+        let npxCleanResult = try await cleanExecExecutor.execute(selectiveNpxItem)
+        XCTAssertEqual(npxCleanResult.status, .cleaned)
+        XCTAssertEqual(npxCleanResult.action, .npmCommand)
+        XCTAssertEqual(recorder.calls, [
+            ["/opt/homebrew/bin/npm", "cache", "npx", "rm", "deadbeef12345678", "--cache", defaultCacheRoot]
+        ])
+
+        // Scenario 5: Alternate npm cache root discovery + validation against unsafe roots
+        let altCacheDir = tempHome.appendingPathComponent(".cache/custom-npm-cache", isDirectory: true)
+        _ = try createFile(relativeToHome: ".cache/custom-npm-cache/_cacache/blob", sizeBytes: 8192)
+        let npmrcURL = tempHome.appendingPathComponent(".npmrc")
+        try "cache=\(altCacheDir.path)\n".write(to: npmrcURL, atomically: true, encoding: .utf8)
+
+        let discoveredAltCaps = await NpmCacheInspector.discoverCapabilities(
+            homeDirectory: tempHome.path,
+            environment: [:],
+            npmBinaryResolver: { "/opt/homebrew/bin/npm" },
+            shellRunner: { _, args in
+                if args == ["cache", "--help"] {
+                    return ShellResult(exitCode: 0, stdout: "npm cache clean\nnpm cache verify\n", stderr: "")
+                }
+                if args == ["--version"] {
+                    return ShellResult(exitCode: 0, stdout: "10.9.9\n", stderr: "")
+                }
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            }
+        )
+        XCTAssertEqual(discoveredAltCaps.effectiveCacheRoot, altCacheDir.standardizedFileURL.path)
+
+        // Unsafe cache roots (project node_modules, .npmrc credentials file, home root) must be rejected
+        XCTAssertThrowsError(
+            try NpmCacheInspector.validateAndCanonicalizeCacheRoot(
+                "\(tempHome.path)/Developer/my-app/node_modules",
+                homeDirectory: tempHome.path
+            )
+        )
+        XCTAssertThrowsError(
+            try NpmCacheInspector.validateAndCanonicalizeCacheRoot(
+                "\(tempHome.path)/.npmrc",
+                homeDirectory: tempHome.path
+            )
+        )
+        XCTAssertThrowsError(
+            try NpmCacheInspector.validateAndCanonicalizeCacheRoot(
+                tempHome.path,
+                homeDirectory: tempHome.path
+            )
+        )
     }
 
     func testStorageMetricsAndAppIconBranding() throws {

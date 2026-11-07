@@ -34,6 +34,7 @@ public enum CleanerCategory: String, Codable, CaseIterable, Identifiable, Sendab
     case googleAI = "Google AI local models"
     case generalCaches = "General developer caches"
     case projectStorage = "Project Storage"
+    case aiWorktreeArtifacts = "AI Worktree Dependencies & Build Artifacts"
 
     public var id: String { rawValue }
 
@@ -52,6 +53,7 @@ public enum CleanerCategory: String, Codable, CaseIterable, Identifiable, Sendab
         case .googleAI: return "brain.head.profile"
         case .generalCaches: return "folder.fill.badge.gearshape"
         case .projectStorage: return "folder.badge.gearshape"
+        case .aiWorktreeArtifacts: return "point.3.connected.trianglepath.dotted"
         }
     }
 }
@@ -60,11 +62,14 @@ public enum CleanupActionType: Codable, Equatable, Sendable {
     case moveToTrash(path: String)
     case moveToTrashContents(directoryPath: String, minAgeDays: Int?)
     case moveToTrashVerifiedProjectArtifact(path: String, projectRoot: String, expectedModifiedAt: Date?)
+    case moveToTrashVerifiedWorktreeArtifact(path: String, worktreeRoot: String, sourceRepoRoot: String, expectedModifiedAt: Date?)
     case simctlDeleteDevice(udid: String)
     case simctlDeleteUnavailable
     case simctlDeleteRuntime(identifier: String)
     case avdManagerDelete(avdName: String, avdPath: String)
     case dockerPrune(subcommand: [String])
+    case npmCacheCommand(cacheRoot: String, subcommand: [String])
+    case npmNpxRemoveKeys(cacheRoot: String, keys: [String])
     case readOnlyInfo(reason: String)
 }
 
@@ -73,6 +78,7 @@ public enum CleanupResultAction: String, Codable, Equatable, Sendable {
     case simctlDelete = "simctl delete"
     case avdManagerDelete = "avdmanager delete"
     case dockerPrune = "Docker prune"
+    case npmCommand = "npm cache"
     case none = "None"
 }
 
@@ -239,48 +245,78 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
     public let udid: String
     public let deviceModel: String
     public let runtimeName: String
+    public let runtimeIdentifier: String
     public let state: String
     public let isAvailable: Bool
+    public let availabilityError: String?
     public let lastUsedAt: Date?
     public let installedAppNames: [String]
     public let hasLocalData: Bool
     public let isFavorite: Bool
+    public let isNamedQADevice: Bool
+    public let xcodeDeveloperDir: String?
 
     public init(
         udid: String,
         deviceModel: String = "",
         runtimeName: String,
+        runtimeIdentifier: String = "",
         state: String,
         isAvailable: Bool,
+        availabilityError: String? = nil,
         lastUsedAt: Date?,
         installedAppNames: [String] = [],
         hasLocalData: Bool = false,
-        isFavorite: Bool = false
+        isFavorite: Bool = false,
+        isNamedQADevice: Bool = false,
+        xcodeDeveloperDir: String? = nil
     ) {
         self.udid = udid
         self.deviceModel = deviceModel
         self.runtimeName = runtimeName
+        self.runtimeIdentifier = runtimeIdentifier
         self.state = state
         self.isAvailable = isAvailable
+        self.availabilityError = availabilityError
         self.lastUsedAt = lastUsedAt
         self.installedAppNames = installedAppNames
         self.hasLocalData = hasLocalData
         self.isFavorite = isFavorite
+        self.isNamedQADevice = isNamedQADevice
+        self.xcodeDeveloperDir = xcodeDeveloperDir
+    }
+
+    public static func isQADeviceName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        let tokens = lower.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+        if tokens.contains("qa") || tokens.contains("screenshots") || tokens.contains("screenshot") ||
+           tokens.contains("fixture") || tokens.contains("baseline") {
+            return true
+        }
+        return false
+    }
+
+    public var isShutdown: Bool {
+        state.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("Shutdown") == .orderedSame
     }
 
     public var isBooted: Bool {
-        state.caseInsensitiveCompare("Shutdown") != .orderedSame
+        !isShutdown
     }
 
     public var displayBadgeText: String {
-        if !isAvailable {
-            return "UNAVAILABLE"
-        }
         if isBooted {
-            return "ACTIVE — protected"
+            if state.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("Booted") == .orderedSame {
+                return "ACTIVE — protected"
+            }
+            return "ACTIVE (\(state.uppercased())) — protected"
         }
         if isFavorite {
             return "FAVORITE — protected"
+        }
+        if !isAvailable {
+            return "UNAVAILABLE"
         }
         return state.uppercased()
     }
@@ -293,11 +329,14 @@ public struct SimulatorMetadata: Codable, Equatable, Sendable {
     }
 
     public func recommendationBadge(referenceDate: Date = Date()) -> String {
+        if isBooted || isFavorite {
+            return "KEEP"
+        }
         if !isAvailable {
             return "UNAVAILABLE"
         }
-        if isBooted || isFavorite {
-            return "KEEP"
+        if isNamedQADevice {
+            return "REVIEW"
         }
         if let lastUsedAt, referenceDate.timeIntervalSince(lastUsedAt) <= Self.keepThresholdSeconds + 5 {
             return "KEEP"
@@ -388,10 +427,26 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
     public var canBeSelected: Bool {
         guard riskLevel != .neverDelete else { return false }
         guard !isRunningDependency else { return false }
-        if simulatorMetadata?.isFavorite == true { return false }
-        if case .readOnlyInfo = actionType { return false }
-        if case .dockerPrune = actionType { return reclaimableSize > 0 }
-        return reclaimableSize > 0 || actionType == .simctlDeleteUnavailable
+        if let sim = simulatorMetadata {
+            if sim.isFavorite || !sim.isShutdown { return false }
+        }
+        switch actionType {
+        case .readOnlyInfo, .simctlDeleteUnavailable:
+            return false
+        case .dockerPrune:
+            return reclaimableSize > 0
+        case .npmCacheCommand(_, let subcommand):
+            if subcommand.contains("verify") {
+                return true
+            }
+            return reclaimableSize > 0
+        case .npmNpxRemoveKeys(_, let keys):
+            return !keys.isEmpty && reclaimableSize > 0
+        case .simctlDeleteDevice:
+            return reclaimableSize > 0 || simulatorMetadata?.isAvailable == false
+        default:
+            return reclaimableSize > 0
+        }
     }
 
     public var hasSparseDifference: Bool {
@@ -402,7 +457,7 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
 
     public var actionKind: CleanupResultAction {
         switch actionType {
-        case .moveToTrash, .moveToTrashContents, .moveToTrashVerifiedProjectArtifact:
+        case .moveToTrash, .moveToTrashContents, .moveToTrashVerifiedProjectArtifact, .moveToTrashVerifiedWorktreeArtifact:
             return .moveToTrash
         case .simctlDeleteDevice, .simctlDeleteUnavailable, .simctlDeleteRuntime:
             return .simctlDelete
@@ -410,6 +465,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
             return .avdManagerDelete
         case .dockerPrune:
             return .dockerPrune
+        case .npmCacheCommand, .npmNpxRemoveKeys:
+            return .npmCommand
         case .readOnlyInfo:
             return .none
         }
@@ -426,6 +483,8 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
             return "\(dir)/*"
         case .moveToTrashVerifiedProjectArtifact(let p, _, _):
             return p
+        case .moveToTrashVerifiedWorktreeArtifact(let p, _, _, _):
+            return p
         case .simctlDeleteDevice(let udid):
             return "xcrun simctl delete \(udid)"
         case .simctlDeleteUnavailable:
@@ -436,6 +495,10 @@ public struct CleanableItem: Identifiable, Codable, Equatable, Sendable {
             return "avdmanager delete avd -n \(avdName)"
         case .dockerPrune(let args):
             return "docker \(args.joined(separator: " "))"
+        case .npmCacheCommand(let cacheRoot, let subcommand):
+            return "npm \(subcommand.joined(separator: " ")) --cache \(cacheRoot)"
+        case .npmNpxRemoveKeys(let cacheRoot, let keys):
+            return "npm cache npx rm \(keys.joined(separator: " ")) --cache \(cacheRoot)"
         case .readOnlyInfo:
             return path
         }

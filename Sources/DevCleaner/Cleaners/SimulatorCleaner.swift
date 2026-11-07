@@ -58,6 +58,7 @@ public struct SimulatorCleaner: CleanerProvider {
         let name: String
         let state: String
         let isAvailable: Bool?
+        let availabilityError: String?
         let deviceTypeIdentifier: String?
         let dataPath: String?
         let dataPathSize: Int64?
@@ -83,15 +84,26 @@ public struct SimulatorCleaner: CleanerProvider {
         public let name: String
         public let state: String
         public let isAvailable: Bool
+        public let runtimeIdentifier: String
+        public let availabilityError: String?
 
-        public init(udid: String, name: String, state: String, isAvailable: Bool) {
+        public init(
+            udid: String,
+            name: String,
+            state: String,
+            isAvailable: Bool,
+            runtimeIdentifier: String = "",
+            availabilityError: String? = nil
+        ) {
             self.udid = udid
             self.name = name
             self.state = state
             self.isAvailable = isAvailable
+            self.runtimeIdentifier = runtimeIdentifier
+            self.availabilityError = availabilityError
         }
 
-        /// True only when the simulator's live state is strictly "Shutdown" (not Booted, Booting, Shutting Down, etc.).
+        /// True only when the simulator's live state is strictly "Shutdown" (not Booted, Creating, Booting, Shutting Down, etc.).
         public var isShutdown: Bool {
             state.trimmingCharacters(in: .whitespacesAndNewlines)
                 .caseInsensitiveCompare("Shutdown") == .orderedSame
@@ -100,13 +112,15 @@ public struct SimulatorCleaner: CleanerProvider {
 
     public static func lookupDeviceState(udid: String, in data: Data) throws -> LiveDeviceState? {
         let decoded = try JSONDecoder().decode(SimctlDevicesResponse.self, from: data)
-        for (_, devices) in decoded.devices {
+        for (runtimeKey, devices) in decoded.devices {
             if let match = devices.first(where: { $0.udid.caseInsensitiveCompare(udid) == .orderedSame }) {
                 return LiveDeviceState(
                     udid: match.udid,
                     name: match.name,
                     state: match.state,
-                    isAvailable: match.isAvailable ?? true
+                    isAvailable: match.isAvailable ?? true,
+                    runtimeIdentifier: runtimeKey,
+                    availabilityError: match.availabilityError
                 )
             }
         }
@@ -191,58 +205,87 @@ public struct SimulatorCleaner: CleanerProvider {
         return Array(Set(appNames)).sorted()
     }
 
+    public static func parseISO8601Timestamp(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = fractional.date(from: raw) {
+            return d
+        }
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return standard.date(from: raw)
+    }
+
     public static func parseDevicesJSON(
         _ data: Data,
         homeDirectory: String,
-        favoriteUDIDs: Set<String> = []
+        favoriteUDIDs: Set<String> = [],
+        xcodeDeveloperDir: String? = nil
     ) throws -> [CleanableItem] {
         let decoded = try JSONDecoder().decode(SimctlDevicesResponse.self, from: data)
-        let isoFormatter = ISO8601DateFormatter()
         var items: [CleanableItem] = []
-        var unavailableCount = 0
-        var unavailableBytes: Int64 = 0
 
         for (runtimeKey, devices) in decoded.devices {
             let runtimeLabel = formatRuntimeKey(runtimeKey)
             for dev in devices {
                 let size = (dev.dataPathSize ?? 0) + (dev.logPathSize ?? 0)
                 let isAvailable = dev.isAvailable ?? true
-                if !isAvailable {
-                    unavailableCount += 1
-                    unavailableBytes += size
-                }
+                let isShutdown = dev.state.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare("Shutdown") == .orderedSame
+                let isBootedOrTransitional = !isShutdown
 
-                let isBooted = dev.state.caseInsensitiveCompare("Shutdown") != .orderedSame
-                guard size > 0 || isBooted || !isAvailable else { continue }
+                guard size > 0 || isBootedOrTransitional || !isAvailable else { continue }
 
-                let lastUsed: Date? = dev.lastUsedAt != nil ? isoFormatter.date(from: dev.lastUsedAt!) : nil
+                let lastUsed = parseISO8601Timestamp(dev.lastUsedAt)
                 let devicePath = dev.dataPath ?? "\(homeDirectory)/Library/Developer/CoreSimulator/Devices/\(dev.udid)/data"
                 let installedApps = detectInstalledApps(inDataPath: devicePath)
                 let hasLocalData = !installedApps.isEmpty || size > 100 * 1024 * 1024
                 let isFavorite = favoriteUDIDs.contains(dev.udid)
+                let isNamedQA = SimulatorMetadata.isQADeviceName(dev.name)
                 let modelLabel = formatDeviceTypeIdentifier(dev.deviceTypeIdentifier, fallbackName: dev.name)
 
                 let meta = SimulatorMetadata(
                     udid: dev.udid,
                     deviceModel: modelLabel,
                     runtimeName: runtimeLabel,
+                    runtimeIdentifier: runtimeKey,
                     state: dev.state,
                     isAvailable: isAvailable,
+                    availabilityError: dev.availabilityError,
                     lastUsedAt: lastUsed,
                     installedAppNames: installedApps,
                     hasLocalData: hasLocalData,
-                    isFavorite: isFavorite
+                    isFavorite: isFavorite,
+                    isNamedQADevice: isNamedQA,
+                    xcodeDeveloperDir: xcodeDeveloperDir
                 )
 
-                // Unavailable/orphaned => SAFE; Shutdown => REVIEW; Booted or Favorite => protected
-                let itemRisk: RiskLevel = isAvailable ? .review : .safe
+                // Both available and unavailable individual devices are classified REVIEW (never automatic SAFE).
+                // Booted/Creating/transitional or Favorite devices are protected (reclaimableSize = 0, non-selectable).
+                let itemRisk: RiskLevel = .review
                 let stateNote: String = {
-                    if isBooted { return "ACTIVE — protected (\(dev.state))" }
+                    if isBootedOrTransitional { return "ACTIVE — protected (\(dev.state))" }
                     if isFavorite { return "FAVORITE — protected" }
-                    return isAvailable ? dev.state : "Unavailable / Orphaned"
+                    if !isAvailable {
+                        if let err = dev.availabilityError, !err.isEmpty {
+                            return "Unavailable (\(err))"
+                        }
+                        return "Unavailable / Orphaned"
+                    }
+                    return dev.state
                 }()
 
-                let availabilityText = isAvailable ? "Available" : "Unavailable"
+                let availabilityText: String = {
+                    if isAvailable { return "Available" }
+                    if let err = dev.availabilityError, !err.isEmpty {
+                        return "Unavailable — \(err)"
+                    }
+                    return "Unavailable"
+                }()
+
+                let qaProtectionNote = isNamedQA ? " • Named QA/Fixture device (preserved unless explicitly selected)" : ""
+                let sizeReportedNote = (size == 0 && !isAvailable) ? " • Size not reported by simctl" : ""
 
                 let appsSummary: String = {
                     if !installedApps.isEmpty {
@@ -254,7 +297,7 @@ public struct SimulatorCleaner: CleanerProvider {
                     return " No installed user apps detected (clean template state)."
                 }()
 
-                let reclaimable: Int64 = (isBooted || isFavorite) ? 0 : size
+                let reclaimable: Int64 = (isBootedOrTransitional || isFavorite) ? 0 : size
 
                 items.append(
                     CleanableItem(
@@ -268,11 +311,11 @@ public struct SimulatorCleaner: CleanerProvider {
                         lastModified: lastUsed,
                         lastUsed: lastUsed,
                         riskLevel: itemRisk,
-                        explanation: "Model: \(modelLabel) • Device: \(dev.name) • Runtime: \(runtimeLabel) • State: \(stateNote) (\(availabilityText)) • Recommendation: \(meta.recommendationBadgeText).\(appsSummary) Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
-                        deletionConsequence: "Deletes this simulator device and its app sandbox data via official 'xcrun simctl delete \(dev.udid)'.",
+                        explanation: "Model: \(modelLabel) • Device: \(dev.name) • UDID: \(dev.udid) • Runtime: \(runtimeLabel) • State: \(stateNote) (\(availabilityText))\(qaProtectionNote)\(sizeReportedNote) • Recommendation: \(meta.recommendationBadgeText).\(appsSummary) Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
+                        deletionConsequence: "Deletes this individual simulator device (\(dev.udid)) and its app sandbox data via official 'xcrun simctl delete \(dev.udid)'. Revalidates Xcode path, UDID, runtime, availability, and Shutdown state before execution.",
                         regenerationImpact: "Simulator device can be recreated in Xcode if needed; installed simulator apps will need a fresh build.",
-                        isRunningDependency: isBooted,
-                        runningProcessNames: isBooted ? ["Simulator (\(dev.state))"] : [],
+                        isRunningDependency: isBootedOrTransitional,
+                        runningProcessNames: isBootedOrTransitional ? ["Simulator (\(dev.state))"] : [],
                         actionType: .simctlDeleteDevice(udid: dev.udid),
                         simulatorMetadata: meta
                     )
@@ -286,27 +329,6 @@ public struct SimulatorCleaner: CleanerProvider {
             }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
-
-        items.insert(
-            CleanableItem(
-                id: "sim-delete-unavailable",
-                name: "Delete Unavailable / Orphaned Simulators (\(unavailableCount) found)",
-                category: .iosSimulators,
-                path: "\(homeDirectory)/Library/Developer/CoreSimulator/Devices",
-                logicalSize: unavailableBytes,
-                physicalSize: unavailableBytes,
-                reclaimableSize: unavailableBytes,
-                lastModified: nil,
-                riskLevel: .safe,
-                explanation: "Orphaned simulator devices whose iOS/watchOS runtime is no longer installed. Deleting a simulator removes its apps and simulator-local data but does not remove your source code.",
-                deletionConsequence: "Runs official 'xcrun simctl delete unavailable' to safely remove orphaned devices.",
-                regenerationImpact: "None — these simulators cannot be booted with current Xcode runtimes.",
-                isRunningDependency: false,
-                runningProcessNames: [],
-                actionType: .simctlDeleteUnavailable
-            ),
-            at: 0
-        )
 
         items.append(
             CleanableItem(
@@ -333,10 +355,21 @@ public struct SimulatorCleaner: CleanerProvider {
     }
 
     public func scan(snapshot: ActiveProcessSnapshot, ageFilter: AgeFilter) async -> [CleanableItem] {
+        let xcodeRes = await ShellRunner.shared.run("/usr/bin/xcode-select", arguments: ["-p"])
+        let activeXcodeDir: String? = {
+            guard xcodeRes.isSuccess else { return nil }
+            let trimmed = xcodeRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }()
         let res = await ShellRunner.shared.run("/usr/bin/xcrun", arguments: ["simctl", "list", "devices", "-j"])
         let favs = FavoriteSimulatorsStore.shared.favoriteUDIDs()
         guard res.isSuccess, let data = res.stdout.data(using: .utf8),
-              let parsed = try? Self.parseDevicesJSON(data, homeDirectory: home, favoriteUDIDs: favs) else {
+              let parsed = try? Self.parseDevicesJSON(
+                  data,
+                  homeDirectory: home,
+                  favoriteUDIDs: favs,
+                  xcodeDeveloperDir: activeXcodeDir
+              ) else {
             return []
         }
         return parsed

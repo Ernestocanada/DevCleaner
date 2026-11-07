@@ -9,6 +9,7 @@ public enum SafetyError: LocalizedError, Equatable {
     case notInExplicitAllowList(String)
     case virtualOrMountedFilesystem(String)
     case unverifiedProjectArtifact(String)
+    case unverifiedWorktree(String)
     case modifiedSinceScan(String)
 
     public var errorDescription: String? {
@@ -29,6 +30,8 @@ public enum SafetyError: LocalizedError, Equatable {
             return "SAFETY BLOCK: Path is a virtual or system-mounted filesystem and must never be deleted: \(p)"
         case .unverifiedProjectArtifact(let p):
             return "SAFETY BLOCK: Project path does not match an explicitly verified regenerable artifact rule: \(p)"
+        case .unverifiedWorktree(let p):
+            return "SAFETY BLOCK: Directory is not a verified Git worktree with valid Git metadata: \(p)"
         case .modifiedSinceScan(let p):
             return "SAFETY BLOCK: Path was modified after the scan completed; re-scan before cleaning: \(p)"
         }
@@ -66,12 +69,23 @@ public enum VerifiedProjectArtifactKind: String, Sendable, Equatable {
 
 public struct SafetyValidator: Sendable {
     public let homeDirectory: String
+    public let additionalAllowedPrefixes: [String]
 
-    public init(homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path) {
+    public init(
+        homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        additionalAllowedPrefixes: [String] = []
+    ) {
         if homeDirectory.hasSuffix("/") && homeDirectory.count > 1 {
             self.homeDirectory = String(homeDirectory.dropLast())
         } else {
             self.homeDirectory = homeDirectory
+        }
+        self.additionalAllowedPrefixes = additionalAllowedPrefixes.map { raw in
+            var s = URL(fileURLWithPath: raw).standardizedFileURL.path
+            if s.hasSuffix("/") && s.count > 1 {
+                s = String(s.dropLast())
+            }
+            return s
         }
     }
 
@@ -108,6 +122,7 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Application Support/Claude/local-agent-mode-sessions",
             "\(homeDirectory)/Library/Application Support/Claude/claude-code-sessions",
             "\(homeDirectory)/Library/Application Support/Claude/claude-code-vm",
+            "\(homeDirectory)/Library/Application Support/Claude/vm_bundles",
             "\(homeDirectory)/Library/Application Support/Codex/artifact-sessions",
             "\(homeDirectory)/Library/Application Support/Codex/Default",
             "\(homeDirectory)/Library/Application Support/Code/User",
@@ -196,7 +211,6 @@ public struct SafetyValidator: Sendable {
             "\(homeDirectory)/Library/Application Support/Claude/Crashpad",
             "\(homeDirectory)/Library/Application Support/Claude/claude-code",
             "\(homeDirectory)/Library/Application Support/Claude/simulator-builds",
-            "\(homeDirectory)/Library/Application Support/Claude/vm_bundles",
             "\(homeDirectory)/Library/Application Support/Codex/Cache",
             "\(homeDirectory)/Library/Application Support/Codex/Code Cache",
             "\(homeDirectory)/Library/Application Support/Codex/GPUCache",
@@ -234,6 +248,7 @@ public struct SafetyValidator: Sendable {
         for sub in ["Cache", "Code Cache", "GPUCache", "DawnWebGPUCache", "DawnGraphiteCache", "ShaderCache", "Crashpad"] {
             prefixes.append("\(homeDirectory)/Library/Application Support/Notion/\(sub)")
         }
+        prefixes.append(contentsOf: additionalAllowedPrefixes)
 
         return prefixes
     }
@@ -244,6 +259,7 @@ public struct SafetyValidator: Sendable {
         ".env",
         ".env.local",
         ".env.production",
+        ".npmrc",
         ".ssh",
         ".gnupg",
         ".aws",
@@ -258,6 +274,9 @@ public struct SafetyValidator: Sendable {
         "credentials.json",
         "client_secret.json",
         "Docker.raw",
+        "rootfs.img",
+        "sessiondata.img",
+        "claudevm.bundle",
         "ca.pem",
         "server.pem",
         "privkey.pem",
@@ -827,6 +846,922 @@ public struct SafetyValidator: Sendable {
 
         if checkSymlinksOnDisk && FileManager.default.fileExists(atPath: normalizedPath) {
             try validateSubtreeForDeletion(normalizedPath, additionalAllowedRoots: [normalizedRoot])
+        }
+
+        return normalizedPath
+    }
+
+    // MARK: - AI Worktree Verification & Artifact Safety Validation
+
+    public struct VerifiedWorktreeArtifactMatch: Sendable, Equatable {
+        public let artifactType: WorktreeArtifactType
+        public let classification: RiskLevel
+        public let reason: String
+        public let reproducibilitySource: String?
+
+        public init(
+            artifactType: WorktreeArtifactType,
+            classification: RiskLevel,
+            reason: String,
+            reproducibilitySource: String? = nil
+        ) {
+            self.artifactType = artifactType
+            self.classification = classification
+            self.reason = reason
+            self.reproducibilitySource = reproducibilitySource
+        }
+    }
+
+    /// Verifies using Git metadata on disk that `rawWorktreePath` is an actual Git worktree (not an arbitrary directory or main repo).
+    public static func verifyWorktreeGitMetadata(
+        at rawWorktreePath: String,
+        isRegisteredLinkedWorktree: Bool = false
+    ) -> (isVerified: Bool, sourceRepoPath: String?, gitDirPath: String?) {
+        let fm = FileManager.default
+        let url = URL(fileURLWithPath: rawWorktreePath).standardizedFileURL
+        let path = url.path
+
+        // Reject if worktree root itself is a symbolic link
+        if let vals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
+            return (false, nil, nil)
+        }
+
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+            return (false, nil, nil)
+        }
+
+        let dotGitURL = url.appendingPathComponent(".git")
+        var dotGitIsDir: ObjCBool = false
+        guard fm.fileExists(atPath: dotGitURL.path, isDirectory: &dotGitIsDir) else {
+            return (false, nil, nil)
+        }
+
+        if !dotGitIsDir.boolValue {
+            // Standard Git worktree: `.git` is a regular file containing `gitdir: <path>`
+            guard let rawContent = try? String(contentsOf: dotGitURL, encoding: .utf8) else {
+                return (false, nil, nil)
+            }
+            let lines = rawContent.components(separatedBy: .newlines)
+            guard let gitdirLine = lines.first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("gitdir:") }) else {
+                return (false, nil, nil)
+            }
+            let targetRaw = gitdirLine
+                .trimmingCharacters(in: .whitespaces)
+                .dropFirst("gitdir:".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !targetRaw.isEmpty else {
+                return (false, nil, nil)
+            }
+
+            let resolvedGitDirURL: URL
+            if targetRaw.hasPrefix("/") {
+                resolvedGitDirURL = URL(fileURLWithPath: targetRaw).standardizedFileURL
+            } else {
+                resolvedGitDirURL = URL(fileURLWithPath: targetRaw, relativeTo: url).standardizedFileURL
+            }
+            let resolvedGitDirPath = resolvedGitDirURL.path
+
+            // Derive source repository path from `/.git/worktrees/<name>` or `commondir`
+            var sourceRepoPath: String? = nil
+            if let range = resolvedGitDirPath.range(of: "/.git/worktrees/") {
+                sourceRepoPath = String(resolvedGitDirPath[..<range.lowerBound])
+            } else {
+                let commonDirFile = resolvedGitDirURL.appendingPathComponent("commondir")
+                if let commonRaw = try? String(contentsOf: commonDirFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                   !commonRaw.isEmpty {
+                    let commonURL = commonRaw.hasPrefix("/")
+                        ? URL(fileURLWithPath: commonRaw).standardizedFileURL
+                        : URL(fileURLWithPath: commonRaw, relativeTo: resolvedGitDirURL).standardizedFileURL
+                    if commonURL.lastPathComponent == ".git" {
+                        sourceRepoPath = commonURL.deletingLastPathComponent().path
+                    } else {
+                        sourceRepoPath = commonURL.path
+                    }
+                }
+            }
+
+            let hasValidGitDirMetadata = fm.fileExists(atPath: resolvedGitDirURL.appendingPathComponent("HEAD").path)
+                || fm.fileExists(atPath: resolvedGitDirURL.appendingPathComponent("commondir").path)
+                || resolvedGitDirPath.contains("/.git/worktrees/")
+                || isRegisteredLinkedWorktree
+
+            guard hasValidGitDirMetadata else {
+                return (false, nil, nil)
+            }
+            return (true, sourceRepoPath, resolvedGitDirPath)
+        } else {
+            // `.git` is a directory: only valid as an AI worktree if located inside `.claude/worktrees/` or `.codex/worktrees/` or explicitly registered
+            let isInAIWorktreeContainer = path.contains("/.claude/worktrees/") || path.contains("/.codex/worktrees/")
+            guard isInAIWorktreeContainer || isRegisteredLinkedWorktree else {
+                return (false, nil, nil)
+            }
+            let headURL = dotGitURL.appendingPathComponent("HEAD")
+            guard let headContent = try? String(contentsOf: headURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                  headContent.hasPrefix("ref: ") || headContent.count >= 7 else {
+                return (false, nil, nil)
+            }
+            var sourceRepoPath: String? = nil
+            if let range = path.range(of: "/.claude/worktrees/") {
+                sourceRepoPath = String(path[..<range.lowerBound])
+            }
+            return (true, sourceRepoPath, dotGitURL.path)
+        }
+    }
+
+    public func isProtectedWorktreeComponent(
+        _ comp: String,
+        fullPath: String = "",
+        isInsideDependencyDir: Bool = false
+    ) -> Bool {
+        if isForbiddenComponentName(comp) {
+            if isPermittedDerivedArtifactComponent(name: comp, fullPath: fullPath) {
+                return false
+            }
+            return true
+        }
+
+        let lower = comp.lowercased()
+
+        // Never delete any .env* file
+        if lower == ".env" || lower.hasPrefix(".env.") || lower.hasSuffix(".env") {
+            return true
+        }
+
+        // Credentials & auth tokens
+        let protectedFiles: Set<String> = [
+            ".npmrc",
+            ".pypirc",
+            ".netrc",
+            "secrets.json",
+            "secret.json",
+            "auth.json",
+            "local.settings.json"
+        ]
+        if protectedFiles.contains(lower) {
+            return true
+        }
+
+        // Certificates, provisioning & private keys
+        let certExtensions = [
+            ".pem", ".crt", ".p12", ".pfx", ".jks", ".keystore",
+            ".mobileprovision", ".provisionprofile", ".mobileconfig", ".csr", ".signing"
+        ]
+        for ext in certExtensions {
+            if lower.hasSuffix(ext) {
+                return true
+            }
+        }
+
+        // Never automatically classify archives, distribution packages, signed apps, or dSYMs as SAFE inside worktree build directories
+        if !isInsideDependencyDir {
+            let distributionAndSymbolExtensions = [
+                ".xcarchive", ".ipa", ".dsym", ".aab", ".pkg", ".dmg"
+            ]
+            for ext in distributionAndSymbolExtensions {
+                if lower.hasSuffix(ext) {
+                    return true
+                }
+            }
+            if lower == "_codesignature" || lower == "coderesources" {
+                return true
+            }
+            let distributionEvidenceFiles: Set<String> = [
+                "distributionsummary.plist",
+                "exportoptions.plist",
+                "packaging.log",
+                "appstoreinfo.plist"
+            ]
+            if distributionEvidenceFiles.contains(lower) {
+                return true
+            }
+        }
+
+        // Databases & local emulator exports
+        let dbExtensions = [".sqlite", ".sqlite3", ".db", ".db-shm", ".db-wal", ".realm"]
+        for ext in dbExtensions {
+            if lower.hasSuffix(ext) {
+                // Allow internal build/package index databases inside verified Xcode build intermediates, package manager stores, or third-party node_modules/Pods packages
+                if isInsideDependencyDir ||
+                   fullPath.contains("/XCBuildData/") ||
+                   fullPath.contains("/Index.noindex/") ||
+                   fullPath.contains("/CompilationCache.noindex/") ||
+                   fullPath.contains("/.cache/pnpm/") ||
+                   fullPath.contains("/.cache/npm/") ||
+                   fullPath.contains("/.cache/yarn/") {
+                    return false
+                }
+                return true
+            }
+        }
+        if lower.hasPrefix("firebase-export") || lower.hasPrefix("firestore-export") {
+            return true
+        }
+
+        // Migrations, uploads, user-generated data, and QA evidence outside third-party node_modules/Pods packages
+        if !isInsideDependencyDir {
+            let protectedDirNames: Set<String> = [
+                "migrations",
+                "migration",
+                "uploads",
+                "user_uploads",
+                "user-data",
+                "userdata",
+                "local-data",
+                "qa-evidence",
+                "evidence"
+            ]
+            if protectedDirNames.contains(lower) || lower.contains("evidence") {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// Validates that `validatedPath` inside `validatedWorktreeRoot` contains no protected files (.env*, databases, certs, credentials, migrations, uploads, QA evidence) and no symlinks escaping `validatedWorktreeRoot`.
+    public func validateWorktreeSubtreeForDeletion(
+        _ validatedPath: String,
+        worktreeRoot validatedWorktreeRoot: String
+    ) throws {
+        let fm = FileManager.default
+        let resolvedWorktreeRoot = URL(fileURLWithPath: validatedWorktreeRoot).resolvingSymlinksInPath().standardizedFileURL.path
+        let lexicalWorktreeRoot = URL(fileURLWithPath: validatedWorktreeRoot).standardizedFileURL.path
+
+        let itemURL = URL(fileURLWithPath: validatedPath)
+        if let vals = try? itemURL.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
+            throw SafetyError.symlinkTraversalRejected(validatedPath)
+        }
+
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: validatedPath, isDirectory: &isDir) else {
+            return
+        }
+
+        let isDepDir = validatedPath.hasSuffix("/node_modules") || validatedPath.contains("/node_modules/") ||
+            validatedPath.hasSuffix("/Pods") || validatedPath.contains("/Pods/")
+
+        if !isDir.boolValue {
+            let name = itemURL.lastPathComponent
+            if isProtectedWorktreeComponent(name, fullPath: validatedPath, isInsideDependencyDir: false) {
+                throw SafetyError.forbiddenFileOrComponent(validatedPath)
+            }
+            return
+        }
+
+        guard let enumerator = fm.enumerator(
+            at: itemURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else {
+            return
+        }
+
+        for case let childURL as URL in enumerator {
+            let name = childURL.lastPathComponent
+            let childPath = childURL.path
+
+            if isProtectedWorktreeComponent(name, fullPath: childPath, isInsideDependencyDir: isDepDir) {
+                if name == ".git" && isPermittedDerivedArtifactComponent(name: name, fullPath: childPath) {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                throw SafetyError.forbiddenFileOrComponent(childPath)
+            }
+
+            if let vals = try? childURL.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
+                // 1. Check lexical symlink destination relative to parent directory (catches broken symlinks escaping via ../)
+                if let rawDest = try? fm.destinationOfSymbolicLink(atPath: childPath) {
+                    if rawDest.split(separator: "/").contains("..") {
+                        let lexicalTarget = URL(fileURLWithPath: rawDest, relativeTo: childURL.deletingLastPathComponent()).standardizedFileURL.path
+                        let insideLexical = lexicalTarget == lexicalWorktreeRoot || lexicalTarget.hasPrefix(lexicalWorktreeRoot + "/")
+                        let insideResolved = lexicalTarget == resolvedWorktreeRoot || lexicalTarget.hasPrefix(resolvedWorktreeRoot + "/")
+                        if !insideLexical && !insideResolved {
+                            throw SafetyError.symlinkTraversalRejected("\(childPath) -> \(rawDest)")
+                        }
+                    } else if rawDest.hasPrefix("/") {
+                        let stdTarget = URL(fileURLWithPath: rawDest).standardizedFileURL.path
+                        let insideLexical = stdTarget == lexicalWorktreeRoot || stdTarget.hasPrefix(lexicalWorktreeRoot + "/")
+                        let insideResolved = stdTarget == resolvedWorktreeRoot || stdTarget.hasPrefix(resolvedWorktreeRoot + "/")
+                        if !insideLexical && !insideResolved {
+                            throw SafetyError.symlinkTraversalRejected("\(childPath) -> \(rawDest)")
+                        }
+                    }
+                }
+
+                // 2. Check resolved realpath on disk
+                let resolvedChild = childURL.resolvingSymlinksInPath().standardizedFileURL.path
+                let insideResolved = resolvedChild == resolvedWorktreeRoot || resolvedChild.hasPrefix(resolvedWorktreeRoot + "/")
+                let insideLexical = resolvedChild == lexicalWorktreeRoot || resolvedChild.hasPrefix(lexicalWorktreeRoot + "/")
+                if !insideResolved && !insideLexical {
+                    throw SafetyError.symlinkTraversalRejected("\(childPath) -> \(resolvedChild)")
+                }
+            }
+        }
+    }
+
+    /// Inspects an artifact inside a worktree and classifies it as SAFE or REVIEW with a specific project-aware reason.
+    public func inspectWorktreeArtifactSafety(
+        at rawPath: String,
+        worktreeRoot rawWorktreeRoot: String
+    ) -> VerifiedWorktreeArtifactMatch? {
+        let fm = FileManager.default
+        let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+        let rootURL = URL(fileURLWithPath: rawWorktreeRoot).standardizedFileURL
+        let path = url.path
+        let rootPath = rootURL.path
+
+        guard path.hasPrefix(rootPath + "/"), path != rootPath else {
+            return nil
+        }
+
+        let relativePath = String(path.dropFirst(rootPath.count + 1))
+        let relativeComponents = relativePath.split(separator: "/").map(String.init)
+        if relativeComponents.contains(".git") {
+            return nil
+        }
+
+        let name = url.lastPathComponent
+        let parentURL = url.deletingLastPathComponent()
+
+        // Check if top-level candidate is itself a symlink
+        if let vals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
+            let inferredType = Self.inferWorktreeArtifactType(name: name, relativePath: relativePath) ?? .cache
+            return VerifiedWorktreeArtifactMatch(
+                artifactType: inferredType,
+                classification: .review,
+                reason: "Artifact is a symbolic link; skipped to prevent symlink escape outside worktree"
+            )
+        }
+
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
+            return nil
+        }
+
+        // Check if any component in relativePath is protected
+        for comp in relativeComponents {
+            let isDep = comp == "node_modules" || comp == "Pods"
+            if isProtectedWorktreeComponent(comp, fullPath: path, isInsideDependencyDir: isDep) {
+                return nil
+            }
+        }
+
+        func findFileInParentOrRoot(_ filenames: [String]) -> String? {
+            for candidate in filenames {
+                if fm.fileExists(atPath: parentURL.appendingPathComponent(candidate).path) {
+                    return candidate
+                }
+            }
+            if parentURL.path != rootPath {
+                for candidate in filenames {
+                    if fm.fileExists(atPath: rootURL.appendingPathComponent(candidate).path) {
+                        return candidate
+                    }
+                }
+            }
+            return nil
+        }
+
+        func directoryHasAny(_ filenames: [String]) -> Bool {
+            filenames.contains { fm.fileExists(atPath: url.appendingPathComponent($0).path) }
+        }
+
+        func topLevelEntries() -> [String] {
+            (try? fm.contentsOfDirectory(atPath: path)) ?? []
+        }
+
+        func packageJSONHasBuildScript(at dirURL: URL) -> Bool {
+            let pkgURL = dirURL.appendingPathComponent("package.json")
+            guard let data = try? Data(contentsOf: pkgURL),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let scripts = json["scripts"] as? [String: Any] else {
+                return false
+            }
+            return scripts.keys.contains { key in
+                let k = key.lowercased()
+                return k == "build" || k.hasPrefix("build:") || k == "compile" || k == "bundle"
+            }
+        }
+
+        func isNativeAppleProjectDirectory(_ dirURL: URL) -> Bool {
+            let dirName = dirURL.lastPathComponent.lowercased()
+            if dirName == "ios" || dirName == "macos" {
+                return true
+            }
+            let siblings = (try? fm.contentsOfDirectory(atPath: dirURL.path)) ?? []
+            return siblings.contains {
+                $0.hasSuffix(".xcodeproj") || $0.hasSuffix(".xcworkspace") || $0 == "Podfile" || $0 == "Podfile.lock"
+            }
+        }
+
+        func hasRecognizableXcodeBuildStructure(at buildDirURL: URL, topEntries: [String]) -> Bool {
+            if let verified = Self.verifyCleanableProjectArtifact(at: buildDirURL.path, projectRoot: rootPath),
+               verified == .xcodeDerivedData || verified == .xcodeSymrootBuild || verified == .swiftPMBuild {
+                return true
+            }
+            let hasXCBuildData = fm.fileExists(atPath: buildDirURL.appendingPathComponent("XCBuildData").path) ||
+                fm.fileExists(atPath: buildDirURL.appendingPathComponent("Build/Intermediates.noindex/XCBuildData").path)
+            let hasIntermediates = fm.fileExists(atPath: buildDirURL.appendingPathComponent("Intermediates.noindex").path) ||
+                fm.fileExists(atPath: buildDirURL.appendingPathComponent("Build/Intermediates.noindex").path) ||
+                topEntries.contains { $0.hasSuffix(".build") }
+            let hasBuildProducts = fm.fileExists(atPath: buildDirURL.appendingPathComponent("Build/Products").path) ||
+                fm.fileExists(atPath: buildDirURL.appendingPathComponent("Products").path) ||
+                topEntries.contains {
+                    $0.hasPrefix("Debug-") || $0.hasPrefix("Release-") ||
+                    $0 == "ExplicitPrecompiledModules" || $0 == "EagerLinkingTBDs"
+                }
+            let hasDerivedMarkers = fm.fileExists(atPath: buildDirURL.appendingPathComponent("ModuleCache.noindex").path) ||
+                fm.fileExists(atPath: buildDirURL.appendingPathComponent("Index.noindex").path)
+
+            return (hasXCBuildData && (hasIntermediates || hasBuildProducts)) ||
+                (hasIntermediates && hasBuildProducts) ||
+                (hasBuildProducts && hasDerivedMarkers)
+        }
+
+        func hasRecognizableJSBuildOutput(at buildDirURL: URL, topEntries: [String]) -> Bool {
+            let knownOutputExts = [".js", ".mjs", ".cjs", ".d.ts", ".d.mts", ".d.cts", ".map", ".css", ".html"]
+            let knownOutputSubdirs: Set<String> = [
+                "assets", "chunks", "static", "esm", "cjs", "types", "server", "client", "public", "browser"
+            ]
+            let knownOutputFiles: Set<String> = [
+                "index.html", "asset-manifest.json", "manifest.json", "stats.json", "routes-manifest.json"
+            ]
+            for entry in topEntries {
+                let lower = entry.lowercased()
+                if knownOutputFiles.contains(lower) || knownOutputSubdirs.contains(lower) {
+                    return true
+                }
+                if knownOutputExts.contains(where: { lower.hasSuffix($0) }) {
+                    return true
+                }
+                let subURL = buildDirURL.appendingPathComponent(entry)
+                if let subEntries = try? fm.contentsOfDirectory(atPath: subURL.path) {
+                    if subEntries.contains(where: { sub in
+                        let subLower = sub.lowercased()
+                        return knownOutputExts.contains(where: { subLower.hasSuffix($0) }) || knownOutputSubdirs.contains(subLower)
+                    }) {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+
+        // First determine base artifact type & project-aware reproducibility
+        var match: VerifiedWorktreeArtifactMatch? = nil
+
+        if !isDir.boolValue {
+            // Regular file: only generated TypeScript incremental metadata (*.tsbuildinfo / .tsbuildinfo)
+            if name.hasSuffix(".tsbuildinfo") || name == ".tsbuildinfo" {
+                if let tsConfig = findFileInParentOrRoot(["tsconfig.json", "tsconfig.build.json", "tsconfig.app.json", "package.json"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .typescriptMetadata,
+                        classification: .safe,
+                        reason: "Git-ignored TypeScript incremental build metadata; reproducible from \(tsConfig)",
+                        reproducibilitySource: tsConfig
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .typescriptMetadata,
+                        classification: .review,
+                        reason: "TypeScript .tsbuildinfo file without matching tsconfig.json"
+                    )
+                }
+            } else {
+                return nil
+            }
+        } else {
+            // Directory candidates
+            let lockfiles = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock", "npm-shrinkwrap.json"]
+
+            if name == "node_modules" {
+                let hasPkgJSON = findFileInParentOrRoot(["package.json"]) != nil
+                if let lockfile = findFileInParentOrRoot(lockfiles), hasPkgJSON {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .nodeModules,
+                        classification: .safe,
+                        reason: "Git-ignored dependency directory; reproducible from \(lockfile)",
+                        reproducibilitySource: lockfile
+                    )
+                } else if hasPkgJSON {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .nodeModules,
+                        classification: .review,
+                        reason: "Dependency directory has package.json but no lockfile (package-lock.json, pnpm-lock.yaml, or yarn.lock)",
+                        reproducibilitySource: "package.json"
+                    )
+                } else if let lockfile = findFileInParentOrRoot(lockfiles) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .nodeModules,
+                        classification: .safe,
+                        reason: "Git-ignored dependency directory; reproducible from \(lockfile)",
+                        reproducibilitySource: lockfile
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .nodeModules,
+                        classification: .review,
+                        reason: "node_modules directory without package.json or lockfile in worktree"
+                    )
+                }
+            } else if name == ".next" {
+                if let cfg = findFileInParentOrRoot(["next.config.ts", "next.config.mjs", "next.config.js", "next.config.cjs", "package.json"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .nextBuild,
+                        classification: .safe,
+                        reason: "Git-ignored Next.js build output; reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .nextBuild,
+                        classification: .review,
+                        reason: "Next.js .next directory without next.config or package.json"
+                    )
+                }
+            } else if name == ".turbo" {
+                if let cfg = findFileInParentOrRoot(["turbo.json", "package.json"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .turboCache,
+                        classification: .safe,
+                        reason: "Git-ignored Turborepo cache; reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .turboCache,
+                        classification: .review,
+                        reason: "Turborepo .turbo directory without turbo.json or package.json"
+                    )
+                }
+            } else if [".expo", ".nuxt", ".svelte-kit", ".astro", ".vite", ".parcel-cache", ".eslintcache", ".metro", ".metro-cache", ".angular", ".docusaurus"].contains(name) {
+                if let cfg = findFileInParentOrRoot([
+                    "app.json", "app.config.js", "app.config.ts", "nuxt.config.ts", "svelte.config.js",
+                    "astro.config.mjs", "vite.config.ts", "vite.config.js", "metro.config.js", "angular.json", "package.json"
+                ]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .frameworkCache,
+                        classification: .safe,
+                        reason: "Git-ignored framework build cache (\(name)); reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .frameworkCache,
+                        classification: .review,
+                        reason: "Framework cache (\(name)) without verified project configuration"
+                    )
+                }
+            } else if name.hasSuffix(".tsbuildinfo") || name == ".tsbuildinfo" {
+                if let cfg = findFileInParentOrRoot(["tsconfig.json", "tsconfig.build.json", "package.json"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .typescriptMetadata,
+                        classification: .safe,
+                        reason: "Git-ignored TypeScript build metadata; reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .typescriptMetadata,
+                        classification: .review,
+                        reason: "TypeScript build metadata without tsconfig.json"
+                    )
+                }
+            } else if name == "Pods" {
+                if let lock = findFileInParentOrRoot(["Podfile.lock"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cocoaPods,
+                        classification: .safe,
+                        reason: "Git-ignored CocoaPods dependency directory; reproducible from \(lock)",
+                        reproducibilitySource: lock
+                    )
+                } else if findFileInParentOrRoot(["Podfile"]) != nil || directoryHasAny(["Manifest.lock", "Target Support Files"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cocoaPods,
+                        classification: .review,
+                        reason: "CocoaPods Pods directory without Podfile.lock; classified as REVIEW"
+                    )
+                }
+            } else if name == ".build" {
+                let entries = topLevelEntries()
+                let hasProtected = entries.contains { $0.hasSuffix(".xcodeproj") || $0.hasSuffix(".xcworkspace") || $0.hasSuffix(".swift") }
+                if !hasProtected && (findFileInParentOrRoot(["Package.swift"]) != nil || directoryHasAny(["workspace-state.json", "checkouts", "debug", "release"])) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .swiftPMBuild,
+                        classification: .safe,
+                        reason: "Git-ignored Swift Package Manager build artifacts; reproducible from Package.swift",
+                        reproducibilitySource: "Package.swift"
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .swiftPMBuild,
+                        classification: .review,
+                        reason: "Unverified .build directory; requires manual review"
+                    )
+                }
+            } else if name == ".gradle" {
+                if let cfg = findFileInParentOrRoot(["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradlew"]) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .gradleCache,
+                        classification: .safe,
+                        reason: "Git-ignored Gradle project cache; reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .gradleCache,
+                        classification: .review,
+                        reason: "Gradle .gradle directory without Gradle build script"
+                    )
+                }
+            } else if relativePath == ".cache/firebase/emulators" || relativePath == ".firebase/emulators" ||
+                        (name == "emulators" && (parentURL.lastPathComponent == "firebase" || parentURL.lastPathComponent == ".firebase")) {
+                let entries = topLevelEntries()
+                let hasEmulatorBinaries = entries.contains {
+                    let l = $0.lowercased()
+                    return l.hasSuffix(".jar") || l.hasSuffix(".zip") || l.contains("emulator") || l.hasPrefix("ui-")
+                }
+                let cfg = findFileInParentOrRoot(["firebase.json", ".firebaserc", "package.json"])
+                if hasEmulatorBinaries || cfg != nil {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .firebaseEmulatorCache,
+                        classification: .safe,
+                        reason: "Git-ignored downloadable Firebase emulator cache; reproducible from \(cfg ?? "Firebase CLI")",
+                        reproducibilitySource: cfg ?? "firebase-tools"
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .firebaseEmulatorCache,
+                        classification: .review,
+                        reason: "Firebase emulators directory without verified downloadable emulator binaries"
+                    )
+                }
+            } else if name == "dist" || name == "build" {
+                let artType: WorktreeArtifactType = (name == "dist") ? .distOutput : .buildOutput
+                let entries = topLevelEntries().filter { $0 != ".DS_Store" }
+                let hasSourceDir = entries.contains {
+                    $0 == "src" || $0.hasSuffix(".xcodeproj") || $0.hasSuffix(".xcworkspace") || $0 == "package.json" || $0 == ".git"
+                }
+
+                if hasSourceDir || entries.isEmpty {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: artType,
+                        classification: .review,
+                        reason: "Directory '\(relativePath)' could not be verified as purely generated build output; classified as REVIEW"
+                    )
+                } else if name == "build" && hasRecognizableXcodeBuildStructure(at: url, topEntries: entries) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: artType,
+                        classification: .safe,
+                        reason: "Git-ignored Xcode build intermediates (\(relativePath)); reproducible from Xcode project",
+                        reproducibilitySource: "Xcode project"
+                    )
+                } else if isNativeAppleProjectDirectory(parentURL) {
+                    // iOS / macOS native directory (e.g., apps/mobile/ios/build): NEVER inherit JS/TS tsconfig.json!
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: artType,
+                        classification: .review,
+                        reason: "iOS/macOS directory '\(relativePath)' lacks recognizable Xcode build intermediates (XCBuildData, Intermediates.noindex, or Build/Products); classified as REVIEW"
+                    )
+                } else if let verifiedKind = Self.verifyCleanableProjectArtifact(at: path, projectRoot: rootPath),
+                          verifiedKind.defaultRiskLevel == .safe {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: artType,
+                        classification: .safe,
+                        reason: "Git-ignored \(verifiedKind.rawValue); reproducible from project build configuration",
+                        reproducibilitySource: verifiedKind.rawValue
+                    )
+                } else {
+                    // JS/TS dist/build: require explicit build/compile/bundle script in immediate parentURL/package.json
+                    // PLUS bundler/compiler config PLUS recognizable generated JS/TS/web output structure.
+                    let hasLocalPackageJSON = fm.fileExists(atPath: parentURL.appendingPathComponent("package.json").path)
+                    let hasLocalBuildScript = hasLocalPackageJSON && packageJSONHasBuildScript(at: parentURL)
+                    let bundlerConfigs = [
+                        "vite.config.ts", "vite.config.js", "vite.config.mjs",
+                        "webpack.config.js", "webpack.config.ts", "rollup.config.js", "tsup.config.ts",
+                        "angular.json", "nest-cli.json", "astro.config.mjs", "svelte.config.js",
+                        "next.config.js", "next.config.mjs", "next.config.ts",
+                        "tsconfig.build.json", "tsconfig.json"
+                    ]
+                    let localConfig = bundlerConfigs.first { fm.fileExists(atPath: parentURL.appendingPathComponent($0).path) }
+                        ?? (hasLocalPackageJSON ? bundlerConfigs.first { fm.fileExists(atPath: rootURL.appendingPathComponent($0).path) } : nil)
+                    let hasOutputStructure = hasRecognizableJSBuildOutput(at: url, topEntries: entries)
+
+                    if hasLocalBuildScript, let cfg = localConfig, hasOutputStructure {
+                        match = VerifiedWorktreeArtifactMatch(
+                            artifactType: artType,
+                            classification: .safe,
+                            reason: "Git-ignored \(name) build output; reproducible from package.json build script and \(cfg)",
+                            reproducibilitySource: "package.json + \(cfg)"
+                        )
+                    } else if !hasLocalBuildScript {
+                        match = VerifiedWorktreeArtifactMatch(
+                            artifactType: artType,
+                            classification: .review,
+                            reason: "Directory '\(relativePath)' lacks an explicit build/compile/bundle script in local package.json; classified as REVIEW"
+                        )
+                    } else if localConfig == nil {
+                        match = VerifiedWorktreeArtifactMatch(
+                            artifactType: artType,
+                            classification: .review,
+                            reason: "Directory '\(relativePath)' lacks a verified bundler or compiler configuration; classified as REVIEW"
+                        )
+                    } else {
+                        match = VerifiedWorktreeArtifactMatch(
+                            artifactType: artType,
+                            classification: .review,
+                            reason: "Directory '\(relativePath)' does not match a known JS/TS generated-output structure; classified as REVIEW"
+                        )
+                    }
+                }
+            } else if parentURL.lastPathComponent == ".cache" || relativePath.hasPrefix(".cache/") {
+                let safeCacheSubnames: Set<String> = [
+                    "npm", "pnpm", "yarn", "corepack", "metro", "metro-cache",
+                    "webpack", "babel-loader", "eslint", "jest", "vitest",
+                    "tsbuildinfo", "turbo", "vite", "parcel", "next"
+                ]
+                if safeCacheSubnames.contains(name) {
+                    let cfg = findFileInParentOrRoot(["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "package.json"]) ?? "project configuration"
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cache,
+                        classification: .safe,
+                        reason: "Git-ignored tool cache (\(relativePath)); reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else if let verifiedKind = Self.verifyCleanableProjectArtifact(at: path, projectRoot: rootPath) {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cache,
+                        classification: verifiedKind.defaultRiskLevel,
+                        reason: verifiedKind.defaultRiskLevel == .safe
+                            ? "Git-ignored \(verifiedKind.rawValue) (\(relativePath)); reproducible from project configuration"
+                            : "\(verifiedKind.rawValue) (\(relativePath)) requires manual review before removal",
+                        reproducibilitySource: verifiedKind.rawValue
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cache,
+                        classification: .review,
+                        reason: "Unverified cache subdirectory (\(relativePath)); classified as REVIEW"
+                    )
+                }
+            } else if name == ".cache" {
+                let entries = topLevelEntries().filter { $0 != ".DS_Store" }
+                let safeCacheSubnames: Set<String> = [
+                    "npm", "pnpm", "yarn", "corepack", "metro", "metro-cache",
+                    "webpack", "babel-loader", "eslint", "jest", "vitest",
+                    "tsbuildinfo", "turbo", "vite", "parcel", "next"
+                ]
+                if !entries.isEmpty && entries.allSatisfy({ safeCacheSubnames.contains($0) }) {
+                    let cfg = findFileInParentOrRoot(["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "package.json"]) ?? "project configuration"
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cache,
+                        classification: .safe,
+                        reason: "Git-ignored developer cache (.cache); reproducible from \(cfg)",
+                        reproducibilitySource: cfg
+                    )
+                } else {
+                    match = VerifiedWorktreeArtifactMatch(
+                        artifactType: .cache,
+                        classification: .review,
+                        reason: "Cache directory (.cache) contains unverified or custom subdirectories; classified as REVIEW"
+                    )
+                }
+            }
+        }
+
+        guard let resolvedMatch = match else {
+            return nil
+        }
+
+        // Perform full subtree safety & symlink containment validation before allowing SAFE
+        do {
+            try validateWorktreeSubtreeForDeletion(path, worktreeRoot: rootPath)
+        } catch let error as SafetyError {
+            let reason: String
+            switch error {
+            case .symlinkTraversalRejected:
+                reason = "Contains symbolic link pointing outside worktree; classified as REVIEW for safety"
+            case .forbiddenFileOrComponent(let blockedPath):
+                let blockedName = URL(fileURLWithPath: blockedPath).lastPathComponent
+                reason = "Contains protected file or directory (\(blockedName)); classified as REVIEW"
+            default:
+                reason = "Contains protected or unverified content; classified as REVIEW"
+            }
+            return VerifiedWorktreeArtifactMatch(
+                artifactType: resolvedMatch.artifactType,
+                classification: .review,
+                reason: reason,
+                reproducibilitySource: resolvedMatch.reproducibilitySource
+            )
+        } catch {
+            return VerifiedWorktreeArtifactMatch(
+                artifactType: resolvedMatch.artifactType,
+                classification: .review,
+                reason: "Safety verification failed; classified as REVIEW",
+                reproducibilitySource: resolvedMatch.reproducibilitySource
+            )
+        }
+
+        return resolvedMatch
+    }
+
+    private static func inferWorktreeArtifactType(name: String, relativePath: String) -> WorktreeArtifactType? {
+        if name == "node_modules" { return .nodeModules }
+        if name == ".next" { return .nextBuild }
+        if name == ".turbo" { return .turboCache }
+        if name == "dist" { return .distOutput }
+        if name == "build" { return .buildOutput }
+        if name == "Pods" { return .cocoaPods }
+        if name == ".build" { return .swiftPMBuild }
+        if name == ".gradle" { return .gradleCache }
+        if name.hasSuffix(".tsbuildinfo") || name == ".tsbuildinfo" { return .typescriptMetadata }
+        if relativePath.contains("firebase/emulators") || relativePath.contains(".firebase/emulators") { return .firebaseEmulatorCache }
+        if name == ".cache" || relativePath.hasPrefix(".cache/") { return .cache }
+        if [".expo", ".nuxt", ".svelte-kit", ".astro", ".vite", ".parcel-cache", ".eslintcache", ".metro", ".metro-cache", ".angular", ".docusaurus"].contains(name) {
+            return .frameworkCache
+        }
+        return nil
+    }
+
+    /// Validates a verified worktree artifact immediately before moving to Trash.
+    public func validateVerifiedWorktreeArtifactForDeletion(
+        _ rawPath: String,
+        worktreeRoot rawWorktreeRoot: String,
+        sourceRepoRoot rawSourceRepoRoot: String? = nil,
+        expectedModifiedAt: Date? = nil,
+        checkSymlinksOnDisk: Bool = true
+    ) throws -> String {
+        let normalizedPath = try expandAndNormalize(rawPath)
+        let normalizedWorktreeRoot = try expandAndNormalize(rawWorktreeRoot)
+
+        // Never delete the worktree root itself or anything outside the worktree root
+        guard normalizedPath.hasPrefix(normalizedWorktreeRoot + "/"), normalizedPath != normalizedWorktreeRoot else {
+            throw SafetyError.forbiddenProtectedPath(normalizedPath)
+        }
+
+        let sensitiveRoots = [
+            "\(homeDirectory)/.ssh",
+            "\(homeDirectory)/.gnupg",
+            "\(homeDirectory)/.aws",
+            "\(homeDirectory)/Documents",
+            "\(homeDirectory)/Desktop",
+            "\(homeDirectory)/Downloads",
+            "\(homeDirectory)/Library",
+            "/System",
+            "/Applications",
+            "/Library"
+        ]
+        for sRoot in sensitiveRoots {
+            if normalizedWorktreeRoot == sRoot || normalizedWorktreeRoot.hasPrefix(sRoot + "/") ||
+               normalizedPath == sRoot || normalizedPath.hasPrefix(sRoot + "/") {
+                throw SafetyError.forbiddenProtectedPath(normalizedPath)
+            }
+        }
+
+        // Verify that worktreeRoot is a genuine Git worktree
+        let wtVerification = Self.verifyWorktreeGitMetadata(at: normalizedWorktreeRoot)
+        guard wtVerification.isVerified else {
+            throw SafetyError.unverifiedWorktree(normalizedWorktreeRoot)
+        }
+
+        let relativePath = String(normalizedPath.dropFirst(normalizedWorktreeRoot.count + 1))
+        let relativeComponents = relativePath.split(separator: "/").map(String.init)
+        for comp in relativeComponents {
+            let isDep = comp == "node_modules" || comp == "Pods"
+            if isProtectedWorktreeComponent(comp, fullPath: normalizedPath, isInsideDependencyDir: isDep) {
+                throw SafetyError.forbiddenFileOrComponent(normalizedPath)
+            }
+        }
+
+        if checkSymlinksOnDisk && FileManager.default.fileExists(atPath: normalizedPath) {
+            let url = URL(fileURLWithPath: normalizedPath)
+            if let vals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]), vals.isSymbolicLink == true {
+                throw SafetyError.symlinkTraversalRejected(normalizedPath)
+            }
+            let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+            let resolvedWorktreeRoot = URL(fileURLWithPath: normalizedWorktreeRoot).resolvingSymlinksInPath().standardizedFileURL.path
+            guard resolvedPath.hasPrefix(resolvedWorktreeRoot + "/") && resolvedPath != resolvedWorktreeRoot else {
+                throw SafetyError.symlinkTraversalRejected("\(normalizedPath) -> \(resolvedPath)")
+            }
+
+            if let expectedModifiedAt {
+                if let modVals = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+                   let currentMod = modVals.contentModificationDate,
+                   currentMod.timeIntervalSince(expectedModifiedAt) > 2.0 {
+                    throw SafetyError.modifiedSinceScan(normalizedPath)
+                }
+            }
+        }
+
+        if checkSymlinksOnDisk && FileManager.default.fileExists(atPath: normalizedPath) {
+            try validateWorktreeSubtreeForDeletion(normalizedPath, worktreeRoot: normalizedWorktreeRoot)
+        }
+
+        guard let match = inspectWorktreeArtifactSafety(at: normalizedPath, worktreeRoot: normalizedWorktreeRoot),
+              match.classification == .safe else {
+            throw SafetyError.unverifiedProjectArtifact(normalizedPath)
         }
 
         return normalizedPath

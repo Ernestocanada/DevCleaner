@@ -379,6 +379,8 @@ public struct MacStorageAnalyzer: Sendable {
             }
         case .projectStorage:
             return .developerTools
+        case .aiWorktreeArtifacts:
+            return .aiTools
         }
     }
 
@@ -388,9 +390,9 @@ public struct MacStorageAnalyzer: Sendable {
         projectSummary: ProjectStorageSummary,
         projectsRootPath: String
     ) -> MacStorageSummary {
-        // Filter out per-artifact .projectStorage items (since projectSummary represents ~/Developer without double counting)
+        // Filter out per-artifact .projectStorage and .aiWorktreeArtifacts items (since projectSummary represents ~/Developer without double counting)
         // and filter out system-mounted /Library/Developer/CoreSimulator/Volumes (`sim-runtimes-preserved`) and virtual `xcode-coredevice-virtual-fs` from physical storage sums
-        let nonProjectProviderItems = providerItems.filter { $0.category != .projectStorage }
+        let nonProjectProviderItems = providerItems.filter { $0.category != .projectStorage && $0.category != .aiWorktreeArtifacts }
         let deduplicated = Self.deduplicateItems(nonProjectProviderItems + additionalItems)
 
         // Exclude system-mounted volumes (/Library/...) & 0-byte virtual mounts from user Mac Storage physical accounting

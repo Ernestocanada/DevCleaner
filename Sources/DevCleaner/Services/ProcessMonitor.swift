@@ -134,7 +134,7 @@ public struct ActiveProcessSnapshot: Sendable {
             }
         case .generalCaches:
             break
-        case .projectStorage:
+        case .projectStorage, .aiWorktreeArtifacts:
             if checkCommand("xcodebuild") {
                 matched.insert("xcodebuild")
             }
